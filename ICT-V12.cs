@@ -34,6 +34,8 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Net;
+using System.Text;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
@@ -101,6 +103,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name="Debug Mode",                    Order=1, GroupName="Debug")]
         public bool DebugMode { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name="Discord Webhook URL",           Order=1, GroupName="Benachrichtigungen",
+            Description="Discord Webhook URL für Backtest-Abschluss-Meldung. Leer lassen = deaktiviert.")]
+        public string DiscordWebhookUrl { get; set; }
+
         // ─── State machine ─────────────────────────────────────────────────
 
         private enum S { Scanning, WaitingSweep1, WaitingSweep2, WaitingCISD }
@@ -141,6 +148,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int      tradesThisDay;
         private DateTime lastTradeDate;
 
+        // ─── Backtest stats (für Discord) ──────────────────────────────────
+        private int      entryCount;
+        private int      winCount;
+        private int      lossCount;
+        private DateTime backtestStart;
+        private DateTime backtestEnd;
+
         // ─── Lifecycle ─────────────────────────────────────────────────────
 
         protected override void OnStateChange()
@@ -169,10 +183,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxContracts      = 3;
                 MaxTradesPerDay   = 2;
                 DebugMode         = true;
+                DiscordWebhookUrl = "";
             }
             else if (State == State.Configure)
             {
                 AddDataSeries(BarsPeriodType.Minute, BiasTFMinutes);
+            }
+            else if (State == State.Terminated)
+            {
+                SendDiscordSummary();
             }
             else if (State == State.DataLoaded)
             {
@@ -187,6 +206,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 biasAvailable = false;
                 tradesThisDay = 0;
                 lastTradeDate = DateTime.MinValue;
+                entryCount    = 0;
+                winCount      = 0;
+                lossCount     = 0;
+                backtestStart = DateTime.MaxValue;
+                backtestEnd   = DateTime.MinValue;
 
                 bias4hHighs  = new List<double>(); bias4hLows   = new List<double>();
                 biasShBars   = new List<int>();    biasShPrices = new List<double>();
@@ -223,6 +247,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (BarsInProgress != 0) return;
             int minWarmup = Math.Max(SwingStrength * 2, MinLegBars) + 10;
             if (CurrentBar < minWarmup) return;
+
+            // Zeitraum für Discord-Nachricht tracken
+            if (Time[0] < backtestStart) backtestStart = Time[0];
+            if (Time[0] > backtestEnd)   backtestEnd   = Time[0];
 
             UpdatePrevDayHL();
             UpdateExecSwings();
@@ -543,7 +571,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (legIsBull) EnterLong (qty, "ICT");
             else           EnterShort(qty, "ICT");
 
-            // Update daily counter
+            // Zähler aktualisieren
+            entryCount++;
             tradesThisDay++;
             lastTradeDate = Time[0].Date;
 
@@ -654,6 +683,56 @@ namespace NinjaTrader.NinjaScript.Strategies
             double riskPerCont = Math.Abs(entry - sl) * Instrument.MasterInstrument.PointValue;
             if (riskPerCont <= 0) return 1;
             return Math.Max(1, (int)(riskUsd / riskPerCont));
+        }
+
+        // ─── Win/Loss Tracking ─────────────────────────────────────────────
+
+        protected override void OnExecutionUpdate(Cbi.Execution execution, string executionId,
+            double price, int quantity, Cbi.MarketPosition marketPosition,
+            string orderId, DateTime time)
+        {
+            if (execution.Order == null) return;
+            if (execution.Order.Name == "Profit target") winCount++;
+            if (execution.Order.Name == "Stop loss")     lossCount++;
+        }
+
+        // ─── Discord Benachrichtigung ──────────────────────────────────────
+
+        private void SendDiscordSummary()
+        {
+            if (string.IsNullOrEmpty(DiscordWebhookUrl)) return;
+
+            try
+            {
+                string start = backtestStart == DateTime.MaxValue ? "?" : backtestStart.ToString("dd.MM.yyyy");
+                string end   = backtestEnd   == DateTime.MinValue ? "?" : backtestEnd.ToString("dd.MM.yyyy");
+                int winRate  = entryCount > 0 ? (int)((double)winCount / entryCount * 100) : 0;
+
+                string msg = string.Format(
+                    "✅ ICT-V12 Backtest abgeschlossen!\\n" +
+                    "📅 Zeitraum: {0} – {1}\\n" +
+                    "📊 Trades: {2}  |  ✅ {3} Gewinner  |  ❌ {4} Verlierer  |  🎯 {5}% Win-Rate\\n" +
+                    "⚙️ MinRR={6} | MaxCt={7} | MaxTrades/Tag={8}",
+                    start, end,
+                    entryCount, winCount, lossCount, winRate,
+                    MinRR, MaxContracts, MaxTradesPerDay);
+
+                // Anführungszeichen im Text escapen
+                msg = msg.Replace("\"", "\\\"");
+                string json = "{\"content\":\"" + msg + "\"}";
+
+                using (var client = new WebClient())
+                {
+                    client.Headers[HttpRequestHeader.ContentType] = "application/json";
+                    client.Encoding = Encoding.UTF8;
+                    client.UploadString(DiscordWebhookUrl, "POST", json);
+                }
+                Print("Discord-Benachrichtigung erfolgreich gesendet.");
+            }
+            catch (Exception ex)
+            {
+                Print($"Discord Fehler: {ex.Message}");
+            }
         }
 
         private void D(string msg) { if (DebugMode) Print(msg); }
