@@ -1,21 +1,23 @@
-// ICT-V8.cs
+// ICT-V9.cs
 // ICT Price Leg Strategy for NQ Futures — NinjaTrader 8
 //
 // ╔══════════════════════════════════════╗
-// ║  VERSION: v8                         ║
+// ║  VERSION: v9                         ║
 // ║  DATE:    2026-03-20                 ║
 // ╚══════════════════════════════════════╝
 //
-// v8 fixes (vs v7):
-//   - BUGFIX: removed AddDataSeries(Day,1) — Series 2 (Daily) caused
-//     "index 5, only 4 bars" crash at bar 1379.
-//     Root cause: BarsArray[2].Count returns total loaded history,
-//     so the guard ">1" passed while the replay was still on day 1.
-//     Highs[2][1] (yesterday) did not yet exist → crash.
-//   - Prev-Day H/L now tracked directly in Exec-TF (BarsInProgress==0)
-//     via Time[0].Date change detection — no secondary series needed.
-//   - Strategy now uses only 2 data series: series 0 (exec) + series 1 (4H)
+// v9 fixes (vs v8):
+//   - BUGFIX: SCAN→S1 Timeout infinite loop with stale legs.
+//     When bias first activates, RunScanning found old legs whose
+//     end bar was already > Sweep1Timeout bars ago.  The loop:
+//       Scan → WaitingSweep1 → Timeout (1 bar later) → Scan → repeat
+//     blocked the strategy for hundreds/thousands of bars.
+//     Fix: add freshness guard in RunScanning:
+//       if (CurrentBar - e.BarIdx > Sweep1Timeout) continue;
+//     Only legs that ended recently (within the timeout window)
+//     are eligible setups.
 //
+// v8: removed Daily series, fix Highs[2][1] OOB crash
 // v7: eliminated Highs[1][n] variable-index access (local list fix)
 // v6: used BarsArray[1].Count — total history, not replay position
 // v5: removed EQ balance check from WaitingSweep1
@@ -34,9 +36,9 @@ using NinjaTrader.NinjaScript.Strategies;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class ICTV8 : Strategy
+    public class ICTV9 : Strategy
     {
-        private const string StrategyVersion = "v8";
+        private const string StrategyVersion = "v9";
 
         // ─── Parameters ────────────────────────────────────────────────────
 
@@ -124,7 +126,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Name                         = "ICTV8";
+                Name                         = "ICTV9";
                 Description                  = "ICT Double Sweep + CISD — NQ Futures " + StrategyVersion;
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
@@ -167,7 +169,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 execSlBars   = new List<int>();    execSlPrices = new List<double>();
 
                 Print("================================================");
-                Print("  ICT-V8 loaded — ICT Double Sweep + CISD");
+                Print("  ICT-V9 loaded — ICT Double Sweep + CISD");
                 Print("  Bias: 4H Structure + Prev Day H/L (Option C)");
                 Print("================================================");
                 D("Waiting for bias data ...");
@@ -362,6 +364,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var s = merged[i];
                 var e = merged[i + 1];
                 if (e.BarIdx - s.BarIdx < MinLegBars) continue;
+
+                // v9 fix: skip legs whose end is already beyond the timeout window.
+                // Without this, the scan locks onto a stale leg on every bar:
+                //   Scan → WaitingSweep1 → immediate Timeout → Scan → repeat.
+                if (CurrentBar - e.BarIdx > Sweep1Timeout) continue;
 
                 bool legBull = s.IsLow && !e.IsLow;
                 bool legBear = !s.IsLow && e.IsLow;
