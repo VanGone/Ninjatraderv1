@@ -1,22 +1,24 @@
-// ICT-V7.cs
+// ICT-V8.cs
 // ICT Price Leg Strategy for NQ Futures — NinjaTrader 8
 //
 // ╔══════════════════════════════════════╗
-// ║  VERSION: v7                         ║
+// ║  VERSION: v8                         ║
 // ║  DATE:    2026-03-20                 ║
 // ╚══════════════════════════════════════╝
 //
-// v7 fixes (vs v6):
-//   - BUGFIX: eliminated all Highs[1][n] / Lows[1][n] variable-index access.
-//     Root cause of the "index 5, only 4 bars" crash:
-//     BarsArray[1].Count returns total loaded history, not the current
-//     replay position — so the bounds guard was always passing too early.
-//     Fix: 4H bar data is stored in local Lists (bias4hHighs / bias4hLows).
-//     Swing detection now uses list indices, which are always valid.
-//     Only Highs[1][0] / Lows[1][0] (current bar = always safe) is used.
+// v8 fixes (vs v7):
+//   - BUGFIX: removed AddDataSeries(Day,1) — Series 2 (Daily) caused
+//     "index 5, only 4 bars" crash at bar 1379.
+//     Root cause: BarsArray[2].Count returns total loaded history,
+//     so the guard ">1" passed while the replay was still on day 1.
+//     Highs[2][1] (yesterday) did not yet exist → crash.
+//   - Prev-Day H/L now tracked directly in Exec-TF (BarsInProgress==0)
+//     via Time[0].Date change detection — no secondary series needed.
+//   - Strategy now uses only 2 data series: series 0 (exec) + series 1 (4H)
 //
-// v6: used BarsArray[1].Count for guard — still crashed (total vs current)
-// v5: removed EQ balance check from WaitingSweep1 (main sweep fix)
+// v7: eliminated Highs[1][n] variable-index access (local list fix)
+// v6: used BarsArray[1].Count — total history, not replay position
+// v5: removed EQ balance check from WaitingSweep1
 // v4: double sweep, CISD-only entry, Bias Option C
 
 #region Using declarations
@@ -32,9 +34,9 @@ using NinjaTrader.NinjaScript.Strategies;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class ICTV7 : Strategy
+    public class ICTV8 : Strategy
     {
-        private const string StrategyVersion = "v7";
+        private const string StrategyVersion = "v8";
 
         // ─── Parameters ────────────────────────────────────────────────────
 
@@ -60,13 +62,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int BiasTFMinutes { get; set; }
 
         [NinjaScriptProperty][Range(1,200)]
-        [Display(Name="Sweep1 Timeout (Bars)",         Order=1, GroupName="Entry Rules",
-            Description="Max bars after leg end to wait for Sweep1")]
+        [Display(Name="Sweep1 Timeout (Bars)",         Order=1, GroupName="Entry Rules")]
         public int Sweep1Timeout { get; set; }
 
         [NinjaScriptProperty][Range(1,50)]
-        [Display(Name="CISD Window (Bars after LL2)",  Order=2, GroupName="Entry Rules",
-            Description="Max bars after second sweep to find CISD close")]
+        [Display(Name="CISD Window (Bars after LL2)",  Order=2, GroupName="Entry Rules")]
         public int CisdWindow { get; set; }
 
         [NinjaScriptProperty][Range(0,100)]
@@ -102,15 +102,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   biasIsBull;
         private bool   biasAvailable;
 
-        // 4H data stored locally — avoids Highs[1][n] variable-index access
+        // 4H data — stored locally to avoid Highs[1][n] variable-index access
         private List<double> bias4hHighs, bias4hLows;
         private List<int>    biasShBars,  biasSlBars;
         private List<double> biasShPrices, biasSlPrices;
         private string struct4h;
 
-        // Previous day high/low (series 2 = Daily)
+        // Prev-Day H/L — tracked via date change in exec TF (no Daily series)
         private double prevDayHigh, prevDayLow;
         private bool   prevDaySet;
+        private double todayHigh, todayLow;
+        private DateTime currentDate;
 
         // Exec TF swing lists
         private List<int>    execShBars,   execSlBars;
@@ -122,7 +124,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Name                         = "ICTV7";
+                Name                         = "ICTV8";
                 Description                  = "ICT Double Sweep + CISD — NQ Futures " + StrategyVersion;
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
@@ -144,16 +146,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                AddDataSeries(BarsPeriodType.Minute, BiasTFMinutes); // series 1 = 4H
-                AddDataSeries(BarsPeriodType.Day,    1);             // series 2 = Daily
+                AddDataSeries(BarsPeriodType.Minute, BiasTFMinutes); // series 1 = 4H only
             }
             else if (State == State.DataLoaded)
             {
-                setupState    = S.Scanning;
-                struct4h      = "none";
-                prevDayHigh   = double.MaxValue;
-                prevDayLow    = double.MinValue;
-                prevDaySet    = false;
+                setupState   = S.Scanning;
+                struct4h     = "none";
+                prevDaySet   = false;
+                prevDayHigh  = double.MaxValue;
+                prevDayLow   = double.MinValue;
+                todayHigh    = double.MinValue;
+                todayLow     = double.MaxValue;
+                currentDate  = DateTime.MinValue;
                 biasAvailable = false;
 
                 bias4hHighs  = new List<double>(); bias4hLows   = new List<double>();
@@ -163,7 +167,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 execSlBars   = new List<int>();    execSlPrices = new List<double>();
 
                 Print("================================================");
-                Print("  ICT-V7 loaded — ICT Double Sweep + CISD");
+                Print("  ICT-V8 loaded — ICT Double Sweep + CISD");
                 Print("  Bias: 4H Structure + Prev Day H/L (Option C)");
                 Print("================================================");
                 D("Waiting for bias data ...");
@@ -174,12 +178,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
-            // ── Series 1: 4H — append bar to local lists, detect swings ────
+            // ── Series 1: 4H — append to local lists, detect swings ────────
             if (BarsInProgress == 1)
             {
-                // Highs[1][0] and Lows[1][0] = current 4H bar's high/low.
-                // Index 0 is ALWAYS valid. We store data locally to avoid
-                // ever calling Highs[1][n] with n > 0 (the crash source).
+                // Only Highs[1][0] / Lows[1][0] used (index 0 = always valid)
                 bias4hHighs.Add(Highs[1][0]);
                 bias4hLows.Add(Lows[1][0]);
 
@@ -191,24 +193,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            // ── Series 2: Daily — previous day high/low ────────────────────
-            if (BarsInProgress == 2)
-            {
-                if (BarsArray[2].Count > 1)
-                {
-                    prevDayHigh = Highs[2][1];
-                    prevDayLow  = Lows[2][1];
-                    prevDaySet  = true;
-                    D($"  [DAY] Prev day H={prevDayHigh:F2} L={prevDayLow:F2}");
-                }
-                return;
-            }
-
             // ── Series 0: Execution TF ─────────────────────────────────────
             if (BarsInProgress != 0) return;
             int minWarmup = Math.Max(SwingStrength * 2, MinLegBars) + 10;
             if (CurrentBar < minWarmup) return;
 
+            UpdatePrevDayHL();   // date-change tracking — no secondary series
             UpdateExecSwings();
             UpdateCombinedBias();
 
@@ -230,12 +220,37 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // ─── Prev-Day H/L via date change (no Daily series) ────────────────
+
+        private void UpdatePrevDayHL()
+        {
+            DateTime barDate = Time[0].Date;
+
+            if (barDate != currentDate)
+            {
+                // New day started — promote today's range to prev day
+                if (currentDate != DateTime.MinValue && todayHigh > double.MinValue)
+                {
+                    prevDayHigh = todayHigh;
+                    prevDayLow  = todayLow;
+                    prevDaySet  = true;
+                    D($"  [DAY] New day {barDate:MM-dd}. Prev day H={prevDayHigh:F2} L={prevDayLow:F2}");
+                }
+                currentDate = barDate;
+                todayHigh   = High[0];
+                todayLow    = Low[0];
+            }
+            else
+            {
+                if (High[0] > todayHigh) todayHigh = High[0];
+                if (Low[0]  < todayLow)  todayLow  = Low[0];
+            }
+        }
+
         // ─── Bias: 4H Market Structure (uses local lists) ───────────────────
 
         private void Update4HSwings(int n)
         {
-            // n = total bars in bias4hHighs / bias4hLows
-            // center of swing pattern = index (n-1-BiasSwingStrength)
             int swingN = BiasSwingStrength;
 
             if (IsSwingHighInList(bias4hHighs, n, swingN))
@@ -260,7 +275,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Swing high: list[center] > all n neighbours on each side
         private bool IsSwingHighInList(List<double> data, int count, int n)
         {
             int center = count - 1 - n;
@@ -424,8 +438,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void RunWaitingCISD()
         {
-            int barsSinceS2 = CurrentBar - sweep2Bar;
-            if (barsSinceS2 > CisdWindow)
+            if (CurrentBar - sweep2Bar > CisdWindow)
             { D($"Bar {CurrentBar}: [CISD] Timeout — reset."); setupState = S.Scanning; return; }
 
             bool cisdBull = legIsBull  && Close[0] > cisdLevel;
