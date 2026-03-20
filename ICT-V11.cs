@@ -1,30 +1,29 @@
-// ICT-V10.cs
+// ICT-V11.cs
 // ICT Price Leg Strategy for NQ Futures — NinjaTrader 8
 //
 // ╔══════════════════════════════════════╗
-// ║  VERSION: v10                        ║
+// ║  VERSION: v11                        ║
 // ║  DATE:    2026-03-20                 ║
 // ╚══════════════════════════════════════╝
 //
-// v10 fixes (vs v9):
-//   - BUGFIX: SCAN→"Price below leg bottom" infinite loop.
-//     After bias activates, RunScanning found a valid leg, entered
-//     WaitingSweep1.  The very next bar: Low[0] < legEndPrice (price
-//     broke through the leg's SL) → "Price below leg bottom" reset →
-//     back to Scanning → same leg found again → repeat every 2 bars.
-//     Root cause: the balanced-check only tested price vs EQ, not vs
-//     the leg endpoints.  A leg should also be invalidated if price
-//     breaks THROUGH the leg end (below SL for bear, above SH for bull).
-//     Fix: extend the balanced-check in RunScanning:
-//       if (legBear && Low[ba]  <= e.Price) { balanced = true; break; }
-//       if (legBull && High[ba] >= e.Price) { balanced = true; break; }
+// v11 changes (vs v10) — trade frequency:
 //
-// v9: added freshness guard (CurrentBar - e.BarIdx > Sweep1Timeout)
-// v8: removed Daily series, fix Highs[2][1] OOB crash
-// v7: eliminated Highs[1][n] variable-index access (local list fix)
-// v6: used BarsArray[1].Count — total history, not replay position
-// v5: removed EQ balance check from WaitingSweep1
-// v4: double sweep, CISD-only entry, Bias Option C
+//   1. BIAS LOGIC: prevDayH/L nur als einmaliger Trigger, nicht jede Bar.
+//      Vorher: biasAvailable = false sobald Close < prevDayHigh (BULL).
+//      Das führte dazu dass Bias bei jedem kleinen Pullback ausging.
+//      Fix: Bias bleibt aktiv solange 4H-Struktur stimmt (bull/bear).
+//      Deaktivierung nur wenn 4H-Struktur auf "none" oder Gegenteil wechselt.
+//      Außerdem: setupState wird auf Scanning gesetzt wenn Bias wegfällt.
+//
+//   2. MinLegBars: 25 → 10
+//      Mehr Legs werden gefunden. 25 Bars = 25 Minuten war zu streng.
+//
+//   3. Sweep1Timeout: 80 → 200 (Parameter-Range auf 500 erhöht)
+//      Mehr Zeit für S1-Sweep. 80 Minuten war zu kurz.
+//
+// v10: balanced-check erweitert (broke through leg end)
+// v9:  freshness guard (CurrentBar - e.BarIdx > Sweep1Timeout)
+// v8:  Daily series entfernt, Highs[2][1] OOB crash gefixt
 
 #region Using declarations
 using System;
@@ -39,9 +38,9 @@ using NinjaTrader.NinjaScript.Strategies;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class ICTV10 : Strategy
+    public class ICTV11 : Strategy
     {
-        private const string StrategyVersion = "v10";
+        private const string StrategyVersion = "v11";
 
         // ─── Parameters ────────────────────────────────────────────────────
 
@@ -53,7 +52,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name="Externes Level Swing Strength", Order=2, GroupName="Leg Detection")]
         public int ExtSwingStrength { get; set; }
 
-        [NinjaScriptProperty][Range(5,500)]
+        [NinjaScriptProperty][Range(1,500)]
         [Display(Name="Min Leg Bars (Exec TF)",        Order=3, GroupName="Leg Detection")]
         public int MinLegBars { get; set; }
 
@@ -66,7 +65,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description="240 = 4H")]
         public int BiasTFMinutes { get; set; }
 
-        [NinjaScriptProperty][Range(1,200)]
+        [NinjaScriptProperty][Range(1,500)]
         [Display(Name="Sweep1 Timeout (Bars)",         Order=1, GroupName="Entry Rules")]
         public int Sweep1Timeout { get; set; }
 
@@ -129,8 +128,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Name                         = "ICTV10";
-                Description                  = "ICT Double Sweep + CISD — NQ Futures v10";
+                Name                         = "ICTV11";
+                Description                  = "ICT Double Sweep + CISD — NQ Futures v11";
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
                 EntryHandling                = EntryHandling.AllEntries;
@@ -140,10 +139,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 SwingStrength     = 3;
                 ExtSwingStrength  = 2;
-                MinLegBars        = 25;
+                MinLegBars        = 10;
                 BiasSwingStrength = 3;
                 BiasTFMinutes     = 240;
-                Sweep1Timeout     = 80;
+                Sweep1Timeout     = 200;
                 CisdWindow        = 15;
                 SlBufferTicks     = 20;
                 RiskPercent       = 1.0;
@@ -155,14 +154,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.DataLoaded)
             {
-                setupState   = S.Scanning;
-                struct4h     = "none";
-                prevDaySet   = false;
-                prevDayHigh  = double.MaxValue;
-                prevDayLow   = double.MinValue;
-                todayHigh    = double.MinValue;
-                todayLow     = double.MaxValue;
-                currentDate  = DateTime.MinValue;
+                setupState    = S.Scanning;
+                struct4h      = "none";
+                prevDaySet    = false;
+                prevDayHigh   = double.MaxValue;
+                prevDayLow    = double.MinValue;
+                todayHigh     = double.MinValue;
+                todayLow      = double.MaxValue;
+                currentDate   = DateTime.MinValue;
                 biasAvailable = false;
 
                 bias4hHighs  = new List<double>(); bias4hLows   = new List<double>();
@@ -172,7 +171,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 execSlBars   = new List<int>();    execSlPrices = new List<double>();
 
                 Print("================================================");
-                Print("  ICT-V10 loaded — ICT Double Sweep + CISD");
+                Print("  ICT-V11 loaded — ICT Double Sweep + CISD");
                 Print("  Bias: 4H Structure + Prev Day H/L (Option C)");
                 Print("================================================");
                 D("Waiting for bias data ...");
@@ -186,7 +185,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ── Series 1: 4H — append to local lists, detect swings ────────
             if (BarsInProgress == 1)
             {
-                // Only Highs[1][0] / Lows[1][0] used (index 0 = always valid)
                 bias4hHighs.Add(Highs[1][0]);
                 bias4hLows.Add(Lows[1][0]);
 
@@ -203,7 +201,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             int minWarmup = Math.Max(SwingStrength * 2, MinLegBars) + 10;
             if (CurrentBar < minWarmup) return;
 
-            UpdatePrevDayHL();   // date-change tracking — no secondary series
+            UpdatePrevDayHL();
             UpdateExecSwings();
             UpdateCombinedBias();
 
@@ -225,7 +223,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // ─── Prev-Day H/L via date change (no Daily series) ────────────────
+        // ─── Prev-Day H/L via date change ──────────────────────────────────
 
         private void UpdatePrevDayHL()
         {
@@ -233,7 +231,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (barDate != currentDate)
             {
-                // New day started — promote today's range to prev day
                 if (currentDate != DateTime.MinValue && todayHigh > double.MinValue)
                 {
                     prevDayHigh = todayHigh;
@@ -252,7 +249,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // ─── Bias: 4H Market Structure (uses local lists) ───────────────────
+        // ─── Bias: 4H Market Structure ──────────────────────────────────────
 
         private void Update4HSwings(int n)
         {
@@ -321,20 +318,39 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void UpdateCombinedBias()
         {
-            if (!prevDaySet || struct4h == "none") { biasAvailable = false; return; }
+            if (!prevDaySet)
+            {
+                biasAvailable = false;
+                return;
+            }
 
-            bool newBull = (struct4h == "bull") && (Close[0] > prevDayHigh);
-            bool newBear = (struct4h == "bear") && (Close[0] < prevDayLow);
+            // 4H structure gone or flipped → deactivate bias, reset setup
+            if (struct4h == "none" ||
+                (biasAvailable && biasIsBull  && struct4h != "bull") ||
+                (biasAvailable && !biasIsBull && struct4h != "bear"))
+            {
+                if (biasAvailable)
+                {
+                    biasAvailable = false;
+                    setupState    = S.Scanning;
+                    D($"Bar {CurrentBar}: [BIAS] deactivated (4H={struct4h}) — setup reset");
+                }
+                return;
+            }
 
-            if (!newBull && !newBear) { biasAvailable = false; return; }
+            if (!biasAvailable)
+            {
+                // Not yet active: prevDay H/L break is the one-time trigger
+                bool newBull = (struct4h == "bull") && (Close[0] > prevDayHigh);
+                bool newBear = (struct4h == "bear") && (Close[0] < prevDayLow);
+                if (!newBull && !newBear) return;
 
-            bool prev  = biasIsBull;
-            biasIsBull    = newBull;
-            biasAvailable = true;
-
-            if (biasIsBull != prev)
+                biasIsBull    = newBull;
+                biasAvailable = true;
                 D($"Bar {CurrentBar}: [BIAS] -> {(biasIsBull ? "BULL" : "BEAR")} " +
                   $"(4H={struct4h} price={Close[0]:F2} prevDH={prevDayHigh:F2} prevDL={prevDayLow:F2})");
+            }
+            // If already active and 4H still agrees → stay active (no price check needed)
         }
 
         // ─── Exec TF swing detection ─────────────────────────────────────────
@@ -368,9 +384,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var e = merged[i + 1];
                 if (e.BarIdx - s.BarIdx < MinLegBars) continue;
 
-                // v9 fix: skip legs whose end is already beyond the timeout window.
-                // Without this, the scan locks onto a stale leg on every bar:
-                //   Scan → WaitingSweep1 → immediate Timeout → Scan → repeat.
+                // Skip legs whose end is already beyond the timeout window
                 if (CurrentBar - e.BarIdx > Sweep1Timeout) continue;
 
                 bool legBull = s.IsLow && !e.IsLow;
@@ -386,9 +400,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     int ba = CurrentBar - (e.BarIdx + k);
                     if (ba < 0) break;
                     if (legBull && Low[ba]  <= eq)      { balanced = true; break; } // retraced to EQ
-                    if (legBull && High[ba] >= e.Price) { balanced = true; break; } // broke above SH top
+                    if (legBull && High[ba] >= e.Price) { balanced = true; break; } // broke above SH
                     if (legBear && High[ba] >= eq)      { balanced = true; break; } // retraced to EQ
-                    if (legBear && Low[ba]  <= e.Price) { balanced = true; break; } // broke below SL bottom
+                    if (legBear && Low[ba]  <= e.Price) { balanced = true; break; } // broke below SL
                 }
                 if (balanced) continue;
 
