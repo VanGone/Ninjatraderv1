@@ -101,6 +101,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private List<int>    biasShBars,   biasSlBars;
         private List<double> biasShPrices, biasSlPrices;
 
+        // Manual 4H bar counter — avoids relying on CurrentBar in BarsInProgress==1 context
+        private int bias4hBarCount;
+
         // ─── Lifecycle ─────────────────────────────────────────────────────
 
         protected override void OnStateChange()
@@ -141,7 +144,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 biasShBars   = new List<int>(); biasShPrices = new List<double>();
                 biasSlBars   = new List<int>(); biasSlPrices = new List<double>();
 
-                biasAvailable = false;
+                biasAvailable  = false;
+                bias4hBarCount = 0;
                 D("Strategy DataLoaded — waiting for bias bars.");
             }
         }
@@ -153,10 +157,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ── Bias TF ────────────────────────────────────────────────────
             if (BarsInProgress == 1)
             {
-                // CurrentBar here is the 4H series bar index
-                if (CurrentBar < BiasSwingStrength * 2) return;
-                UpdateBiasSwings();   // detect 4H swing points
-                UpdateBias();         // re-derive current bias direction
+                bias4hBarCount++;
+                // Use manual counter — CurrentBar may refer to primary TF in some NT builds
+                if (bias4hBarCount < BiasSwingStrength * 2 + 1) return;
+                UpdateBiasSwings();
+                UpdateBias();
                 return;
             }
 
@@ -234,12 +239,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void UpdateBiasSwings()
         {
-            // CurrentBar = 4H bar index in this context (BarsInProgress==1)
-            if (CurrentBar < BiasSwingStrength * 2) return;
+            // bias4hBarCount is checked before calling this method
+            // bias4hBarCount is 1-indexed here (already incremented); convert to 0-indexed
+            int cur0 = bias4hBarCount - 1;
 
             if (BiasIsSwingHigh(BiasSwingStrength))
             {
-                int bar = CurrentBar - BiasSwingStrength;
+                int bar = cur0 - BiasSwingStrength;
                 if (biasShBars.Count == 0 || biasShBars[biasShBars.Count - 1] != bar)
                 {
                     biasShBars.Add(bar);
@@ -249,7 +255,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             if (BiasIsSwingLow(BiasSwingStrength))
             {
-                int bar = CurrentBar - BiasSwingStrength;
+                int bar = cur0 - BiasSwingStrength;
                 if (biasSlBars.Count == 0 || biasSlBars[biasSlBars.Count - 1] != bar)
                 {
                     biasSlBars.Add(bar);
@@ -259,11 +265,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Bias series swing helpers (use Highs[1][] / Lows[1][])
-        // MUST only be called when BarsInProgress==1 and CurrentBar >= n*2
+        // Bias series swing helpers — use bias4hBarCount (manual counter) for bounds
         private bool BiasIsSwingHigh(int n)
         {
-            if (CurrentBar < n * 2) return false;
+            if (bias4hBarCount < n * 2 + 1) return false;
             double r = Highs[1][n];
             for (int i = 1; i <= n; i++)
                 if (Highs[1][n - i] >= r || Highs[1][n + i] >= r) return false;
@@ -271,7 +276,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
         private bool BiasIsSwingLow(int n)
         {
-            if (CurrentBar < n * 2) return false;
+            if (bias4hBarCount < n * 2 + 1) return false;
             double r = Lows[1][n];
             for (int i = 1; i <= n; i++)
                 if (Lows[1][n - i] <= r || Lows[1][n + i] <= r) return false;
@@ -282,11 +287,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void UpdateBias()
         {
-            // BarsInProgress==1 context: CurrentBar = 4H bar index
-            int cur4H = CurrentBar;
+            // bias4hBarCount is 1-indexed (already incremented before this call)
+            int cur4H = bias4hBarCount - 1; // convert to 0-indexed current 4H bar
 
             var merged = BuildMergedSwings(biasShBars, biasShPrices, biasSlBars, biasSlPrices);
             if (merged.Count < 2) return;
+
+            // Track the most recent valid leg for fallback
+            bool fallbackSet      = false;
+            bool fallbackIsBull   = false;
 
             for (int i = merged.Count - 2; i >= 0; i--)
             {
@@ -300,9 +309,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 double eq = (s.Price + e.Price) / 2.0;
 
+                // Save most recent valid leg as fallback (first one we encounter = most recent)
+                if (!fallbackSet)
+                {
+                    fallbackIsBull = isBull;
+                    fallbackSet    = true;
+                }
+
                 // Check if balanced: did price revisit 50% after leg end?
                 bool balanced = false;
-                // k=1 means 1 bar after legEnd; loop while index stays in range
                 for (int k = 1; (e.BarIdx + k) <= cur4H; k++)
                 {
                     int barsAgo = cur4H - (e.BarIdx + k); // guaranteed >= 0
@@ -310,13 +325,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (isBear && Highs[1][barsAgo] >= eq) { balanced = true; break; }
                 }
 
-                // Use this leg (unbalanced = ideal; balanced = fallback)
-                biasIsBull    = isBull;
+                if (!balanced)
+                {
+                    biasIsBull    = isBull;
+                    biasAvailable = true;
+                    D($"  [BIAS] UNBALANCED leg {(isBull?"BULL":"BEAR")} {s.Price:F0}->{e.Price:F0} EQ={eq:F0}");
+                    return; // found unbalanced — done
+                }
+            }
+
+            // Fallback: all legs balanced — use most recent leg direction
+            if (fallbackSet)
+            {
+                biasIsBull    = fallbackIsBull;
                 biasAvailable = true;
-
-                D($"  [BIAS] Leg {(isBull?"BULL":"BEAR")} {s.Price:F0}->{e.Price:F0} EQ={eq:F0} balanced={balanced}");
-
-                if (!balanced) break; // unbalanced found — stop here
+                D($"  [BIAS] Fallback (all balanced) -> {(fallbackIsBull?"BULL":"BEAR")}");
             }
         }
 
@@ -408,20 +431,32 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (CurrentBar < sweepBar + 2) return;
 
-            // Bullish FVG: High[2] < Low[0]
-            // Bearish FVG: Low[2]  > High[0]
+            // Bullish FVG: High[2] < Low[0]  — FVG top must be BELOW leg top (TP)
+            // Bearish FVG: Low[2]  > High[0] — FVG bottom must be ABOVE leg bottom (TP)
             if (legIsBull && High[2] < Low[0])
             {
-                fvgBottom   = High[2];
-                fvgTop      = Low[0];
+                double top = Low[0], bot = High[2];
+                if (top >= legEndPrice)
+                {
+                    D($"Bar {CurrentBar}: [FVG] Bull iFVG {bot:F2}-{top:F2} above TP {legEndPrice:F2} — skip");
+                    return;
+                }
+                fvgBottom   = bot;
+                fvgTop      = top;
                 fvgFoundBar = CurrentBar;
                 setupState  = S.WaitingCISD;
                 D($"Bar {CurrentBar}: [FVG] Bullish iFVG found: {fvgBottom:F2}-{fvgTop:F2}");
             }
             else if (!legIsBull && Low[2] > High[0])
             {
-                fvgTop      = Low[2];
-                fvgBottom   = High[0];
+                double top = Low[2], bot = High[0];
+                if (bot <= legEndPrice)
+                {
+                    D($"Bar {CurrentBar}: [FVG] Bear iFVG {bot:F2}-{top:F2} below TP {legEndPrice:F2} — skip");
+                    return;
+                }
+                fvgTop      = top;
+                fvgBottom   = bot;
                 fvgFoundBar = CurrentBar;
                 setupState  = S.WaitingCISD;
                 D($"Bar {CurrentBar}: [FVG] Bearish iFVG found: {fvgBottom:F2}-{fvgTop:F2}");
