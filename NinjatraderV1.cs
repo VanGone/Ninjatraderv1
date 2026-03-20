@@ -114,7 +114,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EntryHandling                = EntryHandling.AllEntries;
                 IsExitOnSessionCloseStrategy = true;
                 ExitOnSessionCloseSeconds    = 30;
-                MaximumBarsLookBack          = MaximumBarsLookBackInfinite; // needed for deep leg lookbacks
+                MaximumBarsLookBack          = int.MaxValue; // needed for deep leg lookbacks
 
                 SwingStrength     = 3;
                 ExtSwingStrength  = 2;
