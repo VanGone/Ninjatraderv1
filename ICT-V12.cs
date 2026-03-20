@@ -179,11 +179,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 CisdWindow        = 30;
                 SlBufferTicks     = 20;
                 RiskPercent       = 1.0;
-                MinRR             = 1.5;
+                MinRR             = 1.0;
                 MaxContracts      = 3;
-                MaxTradesPerDay   = 2;
+                MaxTradesPerDay   = 3;
                 DebugMode         = true;
-                DiscordWebhookUrl = "";
+                DiscordWebhookUrl = "https://discord.com/api/webhooks/1484608249197236347/o4ZNwiv8QHOUcATntWoC34bzON3738t-ITqeRfVnbZGh_rbKocWn23pQWhUy5r_xlki4";
             }
             else if (State == State.Configure)
             {
