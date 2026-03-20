@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>ICT Strategy – Ninjatraderv1</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117;
+    font-family: 'Segoe UI', sans-serif;
+    color: #e6edf3;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 30px 20px 50px;
+    gap: 30px;
+  }
+  h1 {
+    font-size: 1.4rem;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #58a6ff;
+    border-bottom: 1px solid #30363d;
+    padding-bottom: 12px;
+    width: 100%;
+    max-width: 1100px;
+    text-align: center;
+  }
+  .panels {
+    display: flex;
+    gap: 24px;
+    width: 100%;
+    max-width: 1100px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .panel {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 16px;
+    flex: 1;
+    min-width: 300px;
+  }
+  .panel-title {
+    font-size: 0.75rem;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #8b949e;
+    margin-bottom: 12px;
+    text-align: center;
+  }
+  canvas { display: block; }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    justify-content: center;
+    max-width: 1100px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 16px 24px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    color: #8b949e;
+  }
+  .dot {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .line-sample {
+    width: 28px; height: 3px;
+    flex-shrink: 0;
+  }
+</style>
+</head>
+<body>
+
+<h1>ICT Strategy Sketch — NQ Futures</h1>
+
+<div class="panels">
+  <div class="panel">
+    <div class="panel-title">Phase 1 — 4H Bias</div>
+    <canvas id="c4h" width="340" height="320"></canvas>
+  </div>
+  <div class="panel" style="flex:2; min-width:500px;">
+    <div class="panel-title">Phase 2 — 1M Execution</div>
+    <canvas id="c1m" width="680" height="320"></canvas>
+  </div>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="dot" style="background:#3fb950"></div> Bullish Leg / Move</div>
+  <div class="legend-item"><div class="dot" style="background:#f85149"></div> Bearish Sweep / Retracement</div>
+  <div class="legend-item"><div class="line-sample" style="background:#58a6ff;border-top:2px dashed #58a6ff;height:0"></div> 50% Equilibrium</div>
+  <div class="legend-item"><div class="line-sample" style="background:#d29922;height:2px"></div> Discount Zone</div>
+  <div class="legend-item"><div class="dot" style="background:#bc8cff"></div> Inverse FVG</div>
+  <div class="legend-item"><div class="dot" style="background:#f0883e"></div> CISD Entry</div>
+  <div class="legend-item"><div class="dot" style="background:#f85149"></div> Stop Loss</div>
+  <div class="legend-item"><div class="dot" style="background:#3fb950"></div> Take Profit</div>
+</div>
+
+<script>
+// ─── Helpers ────────────────────────────────────────────────────────────────
+function label(ctx, text, x, y, color='#8b949e', size=11, align='left') {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.font = `${size}px 'Segoe UI'`;
+  ctx.textAlign = align;
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
+function dashed(ctx, x1,y1,x2,y2,color='#58a6ff',dash=[6,4],lw=1) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.restore();
+}
+
+function solid(ctx, x1,y1,x2,y2,color,lw=2) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.restore();
+}
+
+function dot(ctx, x,y,r,color) {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function rect(ctx, x,y,w,h,color,alpha=0.15) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.fillRect(x,y,w,h);
+  ctx.restore();
+}
+
+function arrow(ctx, x1,y1,x2,y2,color,lw=2) {
+  const angle = Math.atan2(y2-y1, x2-x1);
+  const hs = 8;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = lw;
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-hs*Math.cos(angle-0.4), y2-hs*Math.sin(angle-0.4));
+  ctx.lineTo(x2-hs*Math.cos(angle+0.4), y2-hs*Math.sin(angle+0.4));
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function candle(ctx, x, open, close, high, low, bull) {
+  const color = bull ? '#3fb950' : '#f85149';
+  const w = 10;
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([]);
+  // wick
+  ctx.beginPath(); ctx.moveTo(x, high); ctx.lineTo(x, low); ctx.stroke();
+  // body
+  ctx.fillRect(x - w/2, Math.min(open,close), w, Math.abs(close-open) || 2);
+  ctx.restore();
+}
+
+function tag(ctx, text, x, y, bg, fg='#fff', pad=6) {
+  ctx.save();
+  ctx.font = "bold 10px 'Segoe UI'";
+  const tw = ctx.measureText(text).width;
+  ctx.fillStyle = bg;
+  ctx.globalAlpha = 0.9;
+  ctx.beginPath();
+  ctx.roundRect(x - tw/2 - pad, y-9, tw+pad*2, 18, 4);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = fg;
+  ctx.textAlign = 'center';
+  ctx.fillText(text, x, y+3);
+  ctx.restore();
+}
+
+// ─── 4H CHART ───────────────────────────────────────────────────────────────
+(function draw4H() {
+  const cv = document.getElementById('c4h');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+
+  // background grid
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0,0,W,H);
+  for(let y=40; y<H; y+=40) dashed(ctx,40,y,W-20,y,'#21262d',[2,4],1);
+
+  // Leg definition
+  const legStartX = 60,  legStartY = 260;
+  const legTopX   = 200, legTopY   = 60;
+  const eq        = (legStartY + legTopY) / 2;  // ~160
+
+  // Discount fill
+  rect(ctx, 40, eq, W-60, legStartY-eq, '#d29922', 0.08);
+  label(ctx, 'DISCOUNT', 48, eq + 22, '#d29922', 10);
+
+  // EQ line
+  dashed(ctx, 40, eq, W-20, eq, '#58a6ff', [6,4], 1);
+  label(ctx, '50% EQ', W-18, eq-5, '#58a6ff', 10, 'right');
+
+  // Bullish leg
+  solid(ctx, legStartX, legStartY, legTopX, legTopY, '#3fb950', 3);
+  dot(ctx, legStartX, legStartY, 5, '#3fb950');
+  dot(ctx, legTopX,   legTopY,   5, '#3fb950');
+  tag(ctx, 'Leg Start', legStartX, legStartY+18, '#238636');
+  tag(ctx, 'Leg Top', legTopX, legTopY-14, '#238636');
+
+  // Price tries to retrace but DOESN'T reach 50%
+  const retX1 = 220, retY1 = legTopY;
+  const retX2 = 290, retY2 = 120;  // stops above EQ
+  solid(ctx, retX1, retY1, retX2, retY2, '#f85149', 2);
+  dot(ctx, retX2, retY2, 5, '#f85149');
+
+  // "Balanced?" arrow
+  dashed(ctx, retX2, retY2, retX2, eq, '#f85149', [3,3], 1);
+  label(ctx, '✗ EQ nicht', retX2+6, retY2+18, '#f85149', 10);
+  label(ctx, '   erreicht', retX2+6, retY2+30, '#f85149', 10);
+
+  // UNBALANCED badge
+  tag(ctx, 'UNBALANCED', (legStartX+legTopX)/2 - 30, 160, '#1f6feb', '#79c0ff');
+
+  // Bias arrow
+  arrow(ctx, 80, H-30, 160, H-30, '#3fb950', 2);
+  label(ctx, 'BIAS: BULLISH', 168, H-25, '#3fb950', 11);
+})();
+
+// ─── 1M EXECUTION CHART ─────────────────────────────────────────────────────
+(function draw1M() {
+  const cv = document.getElementById('c1m');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0,0,W,H);
+  for(let y=40; y<H; y+=40) dashed(ctx,50,y,W-20,y,'#21262d',[2,4],1);
+
+  // Layout coords
+  const legBotX=70,  legBotY=270;
+  const legTopX=260, legTopY=40;
+  const eq = (legBotY+legTopY)/2; // ~155
+
+  // Discount zone
+  rect(ctx, 50, eq, W-70, legBotY-eq, '#d29922', 0.07);
+  label(ctx, 'DISCOUNT ZONE', 56, eq+18, '#d29922', 10);
+
+  // EQ line
+  dashed(ctx, 50, eq, W-20, eq, '#58a6ff', [6,4], 1.5);
+  label(ctx, '50% EQ', W-18, eq-5, '#58a6ff', 10, 'right');
+
+  // TP line
+  dashed(ctx, 50, legTopY, W-20, legTopY, '#3fb950', [4,4], 1);
+  label(ctx, 'TP — Leg Top', W-18, legTopY-6, '#3fb950', 10, 'right');
+
+  // Bullish leg (price action up)
+  solid(ctx, legBotX, legBotY, legTopX, legTopY, '#3fb950', 3);
+  dot(ctx, legBotX, legBotY, 5, '#3fb950');
+  dot(ctx, legTopX, legTopY, 5, '#3fb950');
+
+  // Internal lows (formed DURING the leg, in discount)
+  const internalLows = [
+    { x: 100, y: 230 },
+    { x: 145, y: 200 },
+    { x: 195, y: 178 },
+  ];
+  internalLows.forEach((p,i) => {
+    dot(ctx, p.x, p.y, 4, '#d29922');
+    dashed(ctx, p.x, p.y, p.x, legBotY+10, '#d29922', [3,3], 1);
+    label(ctx, `Low ${String.fromCharCode(65+i)}`, p.x-10, p.y+14, '#d29922', 9);
+  });
+
+  // Retracement after leg complete
+  const retStartX = 260, retStartY = legTopY;
+  const retEndX   = 310, retEndY   = 190;
+  solid(ctx, retStartX, retStartY, retEndX, retEndY, '#f85149', 2);
+
+  // First sweep — sweeps Low A
+  const sweep1X = 335, sweep1Y = 248;
+  solid(ctx, retEndX, retEndY, sweep1X, sweep1Y, '#f85149', 2);
+  dot(ctx, sweep1X, sweep1Y, 5, '#f85149');
+  tag(ctx, 'LL1 — 1. Sweep', sweep1X, sweep1Y+16, '#da3633');
+
+  // small bounce
+  const bounce1X = 360, bounce1Y = 225;
+  solid(ctx, sweep1X, sweep1Y, bounce1X, bounce1Y, '#3fb950', 1.5);
+
+  // Second sweep — sweeps LL1
+  const sweep2X = 390, sweep2Y = 262;
+  solid(ctx, bounce1X, bounce1Y, sweep2X, sweep2Y, '#f85149', 2);
+  dot(ctx, sweep2X, sweep2Y, 6, '#f85149');
+  tag(ctx, 'LL2 — 2. Sweep', sweep2X+4, sweep2Y+16, '#da3633');
+
+  // SL line
+  dashed(ctx, 50, sweep2Y+10, W-20, sweep2Y+10, '#f85149', [3,3], 1);
+  label(ctx, 'SL', W-18, sweep2Y+8, '#f85149', 10, 'right');
+
+  // Counter-move / reaction
+  const reactEndX = 450, reactEndY = 195;
+  solid(ctx, sweep2X, sweep2Y, reactEndX, reactEndY, '#3fb950', 2);
+
+  // Inverse FVG zone
+  const fvgTop = 183, fvgBot = 198;
+  rect(ctx, 415, fvgTop, 120, fvgBot-fvgTop, '#bc8cff', 0.25);
+  dashed(ctx, 415, fvgTop, 535, fvgTop, '#bc8cff', [4,3], 1);
+  dashed(ctx, 415, fvgBot, 535, fvgBot, '#bc8cff', [4,3], 1);
+  label(ctx, 'Inverse FVG', 418, fvgTop-5, '#bc8cff', 10);
+
+  // CISD candle — closes above FVG top
+  const cisdX = 480;
+  candle(ctx, cisdX, fvgBot+2, fvgTop-12, fvgTop-18, fvgBot+8, true);
+  tag(ctx, 'CISD ✓', cisdX, fvgTop-28, '#9e6a03', '#e3b341');
+
+  // Entry point
+  const entryX = 510, entryY = fvgTop - 8;
+  dot(ctx, entryX, entryY, 7, '#f0883e');
+  tag(ctx, 'ENTRY LONG ▲', entryX+10, entryY-14, '#b45309', '#ffa657');
+
+  // Move to TP after entry
+  solid(ctx, entryX, entryY, 640, legTopY+8, '#3fb950', 2.5);
+  dot(ctx, 640, legTopY+8, 6, '#3fb950');
+
+  // Labels: Leg Start/Top
+  tag(ctx, 'Leg Start', legBotX, legBotY+18, '#238636');
+  tag(ctx, 'Leg Top', legTopX, legTopY-14, '#238636');
+
+  // Confluence annotations
+  label(ctx, '+ SMT Divergence an LL1/LL2', 290, H-44, '#8b949e', 9);
+  label(ctx, '+ HTF FVG im Einstiegsbereich', 290, H-30, '#8b949e', 9);
+  label(ctx, '+ BOS / CHoCH vor Entry', 290, H-16, '#8b949e', 9);
+
+  // Step numbers
+  const steps = [
+    [legBotX-15, legBotY-20, '①'],
+    [legTopX+8,  legTopY+20, '②'],
+    [sweep1X+14, sweep1Y-8,  '③'],
+    [sweep2X+14, sweep2Y-8,  '④'],
+    [cisdX+16,   fvgTop-10,  '⑤'],
+    [entryX+22,  entryY+4,   '⑥'],
+  ];
+  steps.forEach(([x,y,n]) => label(ctx, n, x, y, '#58a6ff', 13));
+})();
+</script>
+</body>
+</html>
