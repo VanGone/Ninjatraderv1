@@ -1,13 +1,23 @@
-// NinjatraderV1.cs  — v4
+// NinjatraderV1.cs
 // ICT Price Leg Strategy for NQ Futures — NinjaTrader 8
 //
+// ╔══════════════════════════════════════╗
+// ║  VERSION: v5                         ║
+// ║  DATE:    2026-03-20                 ║
+// ╚══════════════════════════════════════╝
+//
+// v5 fixes (vs v4):
+//   - BUGFIX: removed EQ balance check from WaitingSweep1
+//     (externe level is below EQ → price must cross EQ to sweep it,
+//      old check fired before every sweep making it impossible)
+//   - WaitingSweep1 now only resets on: leg top break OR Sweep1Timeout
+//   - Added Sweep1Timeout parameter (default 80 bars)
+//   - Version string printed on DataLoaded for easy identification
+//
 // v4 changes:
-//   - Double sweep: Externe Low swept (LL1) → LL1 swept again (LL2) → then entry
-//   - CISD-only entry: no iFVG required
-//     CISD level = highest high between Sweep1 and Sweep2 (reaction high)
-//   - New bias Option C: 4H Market Structure (HH/HL vs LH/LL)
-//                      + Previous Day High/Low confirmation (series 2)
-//                        Both must align for a valid trade bias
+//   - Double sweep: Externe Low (LL1) → LL1 swept again (LL2) → entry
+//   - CISD-only entry (no iFVG)
+//   - Bias Option C: 4H Market Structure + Previous Day H/L (both must align)
 
 #region Using declarations
 using System;
@@ -24,6 +34,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public class NinjatraderV1 : Strategy
     {
+        private const string StrategyVersion = "v5";
+
         // ─── Parameters ────────────────────────────────────────────────────
 
         [NinjaScriptProperty][Range(1,20)]
@@ -118,7 +130,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name                         = "NinjatraderV1";
-                Description                  = "ICT Double Sweep + CISD — NQ Futures v4";
+                Description                  = "ICT Double Sweep + CISD — NQ Futures " + StrategyVersion;
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
                 EntryHandling                = EntryHandling.AllEntries;
@@ -157,7 +169,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 biasShBars   = new List<int>(); biasShPrices = new List<double>();
                 biasSlBars   = new List<int>(); biasSlPrices = new List<double>();
 
-                D("DataLoaded — waiting for bias data.");
+                Print($"================================================");
+                Print($"  NinjatraderV1 {StrategyVersion} loaded — ICT Double Sweep + CISD");
+                Print($"  Bias: 4H Structure + Prev Day H/L (Option C)");
+                Print($"================================================");
+                D("Waiting for bias data ...");
             }
         }
 
