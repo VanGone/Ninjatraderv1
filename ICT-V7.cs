@@ -1,25 +1,23 @@
-// ICT-V6.cs
+// ICT-V7.cs
 // ICT Price Leg Strategy for NQ Futures — NinjaTrader 8
 //
 // ╔══════════════════════════════════════╗
-// ║  VERSION: v6                         ║
+// ║  VERSION: v7                         ║
 // ║  DATE:    2026-03-20                 ║
 // ╚══════════════════════════════════════╝
 //
-// v6 fixes (vs v5):
-//   - BUGFIX: replaced bias4hBarCount with BarsArray[1].Count for all
-//     series-1 bounds checks — bias4hBarCount could diverge from actual
-//     available bars, causing "index 5, only 4 bars" crash at bar ~1379
-//   - Added inner safety check in Bias4HIsSwingHigh/Low loop
-//   - Removed bias4hBarCount field entirely (no longer needed)
+// v7 fixes (vs v6):
+//   - BUGFIX: eliminated all Highs[1][n] / Lows[1][n] variable-index access.
+//     Root cause of the "index 5, only 4 bars" crash:
+//     BarsArray[1].Count returns total loaded history, not the current
+//     replay position — so the bounds guard was always passing too early.
+//     Fix: 4H bar data is stored in local Lists (bias4hHighs / bias4hLows).
+//     Swing detection now uses list indices, which are always valid.
+//     Only Highs[1][0] / Lows[1][0] (current bar = always safe) is used.
 //
-// v5 fixes:
-//   - Removed EQ balance check from WaitingSweep1 (main bug fix)
-//   - WaitingSweep1 resets only on leg top break or Sweep1Timeout
-//   - Added Sweep1Timeout parameter (default 80 bars)
-//
-// v4:
-//   - Double sweep, CISD-only entry, Bias Option C
+// v6: used BarsArray[1].Count for guard — still crashed (total vs current)
+// v5: removed EQ balance check from WaitingSweep1 (main sweep fix)
+// v4: double sweep, CISD-only entry, Bias Option C
 
 #region Using declarations
 using System;
@@ -34,9 +32,9 @@ using NinjaTrader.NinjaScript.Strategies;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class ICTV6 : Strategy
+    public class ICTV7 : Strategy
     {
-        private const string StrategyVersion = "v6";
+        private const string StrategyVersion = "v7";
 
         // ─── Parameters ────────────────────────────────────────────────────
 
@@ -94,15 +92,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   legIsBull;
         private double activeExtLevel;
 
-        // Sweep 1
-        private int    sweep1Bar;
-        private double sweep1Extreme;
-
-        // Sweep 2
-        private int    sweep2Bar;
-        private double sweep2Extreme;
-
-        // CISD level = highest high (bull) / lowest low (bear) between S1 and S2
+        // Sweeps
+        private int    sweep1Bar;   private double sweep1Extreme;
+        private int    sweep2Bar;   private double sweep2Extreme;
         private double cisdLevel;
 
         // ─── Bias ──────────────────────────────────────────────────────────
@@ -110,14 +102,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   biasIsBull;
         private bool   biasAvailable;
 
-        // 4H market structure
-        private List<int>    biasShBars,   biasSlBars;
+        // 4H data stored locally — avoids Highs[1][n] variable-index access
+        private List<double> bias4hHighs, bias4hLows;
+        private List<int>    biasShBars,  biasSlBars;
         private List<double> biasShPrices, biasSlPrices;
-        private string struct4h; // "bull" | "bear" | "none"
+        private string struct4h;
 
         // Previous day high/low (series 2 = Daily)
-        private double prevDayHigh;
-        private double prevDayLow;
+        private double prevDayHigh, prevDayLow;
         private bool   prevDaySet;
 
         // Exec TF swing lists
@@ -130,7 +122,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Name                         = "ICTV6";
+                Name                         = "ICTV7";
                 Description                  = "ICT Double Sweep + CISD — NQ Futures " + StrategyVersion;
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
@@ -164,13 +156,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 prevDaySet    = false;
                 biasAvailable = false;
 
-                execShBars   = new List<int>(); execShPrices = new List<double>();
-                execSlBars   = new List<int>(); execSlPrices = new List<double>();
-                biasShBars   = new List<int>(); biasShPrices = new List<double>();
-                biasSlBars   = new List<int>(); biasSlPrices = new List<double>();
+                bias4hHighs  = new List<double>(); bias4hLows   = new List<double>();
+                biasShBars   = new List<int>();    biasShPrices = new List<double>();
+                biasSlBars   = new List<int>();    biasSlPrices = new List<double>();
+                execShBars   = new List<int>();    execShPrices = new List<double>();
+                execSlBars   = new List<int>();    execSlPrices = new List<double>();
 
                 Print("================================================");
-                Print("  ICT-V6 loaded — ICT Double Sweep + CISD");
+                Print("  ICT-V7 loaded — ICT Double Sweep + CISD");
                 Print("  Bias: 4H Structure + Prev Day H/L (Option C)");
                 Print("================================================");
                 D("Waiting for bias data ...");
@@ -181,19 +174,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
-            // ── Series 1: 4H — track swings + market structure ─────────────
+            // ── Series 1: 4H — append bar to local lists, detect swings ────
             if (BarsInProgress == 1)
             {
-                // Use BarsArray[1].Count as the authoritative bar count for series 1.
-                // bias4hBarCount was removed — it could diverge from actual available bars.
-                int bars1 = BarsArray[1].Count;
-                if (bars1 < BiasSwingStrength * 2 + 1) return;
-                Update4HSwings(bars1);
+                // Highs[1][0] and Lows[1][0] = current 4H bar's high/low.
+                // Index 0 is ALWAYS valid. We store data locally to avoid
+                // ever calling Highs[1][n] with n > 0 (the crash source).
+                bias4hHighs.Add(Highs[1][0]);
+                bias4hLows.Add(Lows[1][0]);
+
+                int n = bias4hHighs.Count;
+                if (n < BiasSwingStrength * 2 + 1) return;
+
+                Update4HSwings(n);
                 Update4HStructure();
                 return;
             }
 
-            // ── Series 2: Daily — track previous day high/low ──────────────
+            // ── Series 2: Daily — previous day high/low ────────────────────
             if (BarsInProgress == 2)
             {
                 if (BarsArray[2].Count > 1)
@@ -232,31 +230,55 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // ─── Bias: 4H Market Structure ─────────────────────────────────────
+        // ─── Bias: 4H Market Structure (uses local lists) ───────────────────
 
-        private void Update4HSwings(int bars1)
+        private void Update4HSwings(int n)
         {
-            if (Bias4HIsSwingHigh(BiasSwingStrength, bars1))
+            // n = total bars in bias4hHighs / bias4hLows
+            // center of swing pattern = index (n-1-BiasSwingStrength)
+            int swingN = BiasSwingStrength;
+
+            if (IsSwingHighInList(bias4hHighs, n, swingN))
             {
-                // bar index relative to series-1 position
-                int bar = (bars1 - 1) - BiasSwingStrength;
+                int bar = n - 1 - swingN;
                 if (biasShBars.Count == 0 || biasShBars[biasShBars.Count - 1] != bar)
                 {
                     biasShBars.Add(bar);
-                    biasShPrices.Add(Highs[1][BiasSwingStrength]);
-                    D($"  [4H] Swing HIGH bar={bar} price={Highs[1][BiasSwingStrength]:F2}");
+                    biasShPrices.Add(bias4hHighs[bar]);
+                    D($"  [4H] Swing HIGH idx={bar} price={bias4hHighs[bar]:F2}");
                 }
             }
-            if (Bias4HIsSwingLow(BiasSwingStrength, bars1))
+            if (IsSwingLowInList(bias4hLows, n, swingN))
             {
-                int bar = (bars1 - 1) - BiasSwingStrength;
+                int bar = n - 1 - swingN;
                 if (biasSlBars.Count == 0 || biasSlBars[biasSlBars.Count - 1] != bar)
                 {
                     biasSlBars.Add(bar);
-                    biasSlPrices.Add(Lows[1][BiasSwingStrength]);
-                    D($"  [4H] Swing LOW  bar={bar} price={Lows[1][BiasSwingStrength]:F2}");
+                    biasSlPrices.Add(bias4hLows[bar]);
+                    D($"  [4H] Swing LOW  idx={bar} price={bias4hLows[bar]:F2}");
                 }
             }
+        }
+
+        // Swing high: list[center] > all n neighbours on each side
+        private bool IsSwingHighInList(List<double> data, int count, int n)
+        {
+            int center = count - 1 - n;
+            if (center - n < 0 || center + n >= count) return false;
+            double r = data[center];
+            for (int i = 1; i <= n; i++)
+                if (data[center - i] >= r || data[center + i] >= r) return false;
+            return true;
+        }
+
+        private bool IsSwingLowInList(List<double> data, int count, int n)
+        {
+            int center = count - 1 - n;
+            if (center - n < 0 || center + n >= count) return false;
+            double r = data[center];
+            for (int i = 1; i <= n; i++)
+                if (data[center - i] <= r || data[center + i] <= r) return false;
+            return true;
         }
 
         private void Update4HStructure()
@@ -282,11 +304,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (!prevDaySet || struct4h == "none") { biasAvailable = false; return; }
 
-            bool dayBull = Close[0] > prevDayHigh;
-            bool dayBear = Close[0] < prevDayLow;
-
-            bool newBull = (struct4h == "bull") && dayBull;
-            bool newBear = (struct4h == "bear") && dayBear;
+            bool newBull = (struct4h == "bull") && (Close[0] > prevDayHigh);
+            bool newBear = (struct4h == "bear") && (Close[0] < prevDayLow);
 
             if (!newBull && !newBear) { biasAvailable = false; return; }
 
@@ -299,7 +318,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                   $"(4H={struct4h} price={Close[0]:F2} prevDH={prevDayHigh:F2} prevDL={prevDayLow:F2})");
         }
 
-        // ─── Exec TF swing detection ────────────────────────────────────────
+        // ─── Exec TF swing detection ─────────────────────────────────────────
 
         private void UpdateExecSwings()
         {
@@ -317,7 +336,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // ─── State machine ──────────────────────────────────────────────────
+        // ─── State machine ───────────────────────────────────────────────────
 
         private void RunScanning()
         {
@@ -367,13 +386,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar <= legEndBar) return;
 
             if (CurrentBar - legEndBar > Sweep1Timeout)
-            {
-                D($"Bar {CurrentBar}: [S1] Timeout — reset.");
-                setupState = S.Scanning; return;
-            }
+            { D($"Bar {CurrentBar}: [S1] Timeout — reset."); setupState = S.Scanning; return; }
 
-            if (legIsBull  && High[0] > legEndPrice) { D($"Bar {CurrentBar}: [S1] Price above leg top — reset."); setupState = S.Scanning; return; }
-            if (!legIsBull && Low[0]  < legEndPrice) { D($"Bar {CurrentBar}: [S1] Price below leg bottom — reset."); setupState = S.Scanning; return; }
+            if (legIsBull  && High[0] > legEndPrice)
+            { D($"Bar {CurrentBar}: [S1] Price above leg top — reset."); setupState = S.Scanning; return; }
+            if (!legIsBull && Low[0]  < legEndPrice)
+            { D($"Bar {CurrentBar}: [S1] Price below leg bottom — reset."); setupState = S.Scanning; return; }
 
             bool swept = legIsBull ? Low[0] < activeExtLevel : High[0] > activeExtLevel;
             if (swept)
@@ -398,18 +416,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            if (legIsBull  && High[0] > legEndPrice) { D($"Bar {CurrentBar}: [S2] Price above leg top — reset."); setupState = S.Scanning; }
-            if (!legIsBull && Low[0]  < legEndPrice) { D($"Bar {CurrentBar}: [S2] Price below leg bottom — reset."); setupState = S.Scanning; }
+            if (legIsBull  && High[0] > legEndPrice)
+            { D($"Bar {CurrentBar}: [S2] Price above leg top — reset."); setupState = S.Scanning; }
+            if (!legIsBull && Low[0]  < legEndPrice)
+            { D($"Bar {CurrentBar}: [S2] Price below leg bottom — reset."); setupState = S.Scanning; }
         }
 
         private void RunWaitingCISD()
         {
             int barsSinceS2 = CurrentBar - sweep2Bar;
             if (barsSinceS2 > CisdWindow)
-            {
-                D($"Bar {CurrentBar}: [CISD] Timeout ({barsSinceS2} bars) — reset.");
-                setupState = S.Scanning; return;
-            }
+            { D($"Bar {CurrentBar}: [CISD] Timeout — reset."); setupState = S.Scanning; return; }
 
             bool cisdBull = legIsBull  && Close[0] > cisdLevel;
             bool cisdBear = !legIsBull && Close[0] < cisdLevel;
@@ -422,13 +439,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 sl = sweep2Extreme - SlBufferTicks * TickSize;
                 tp = legEndPrice;
-                if (tp <= entry) { D($"Bar {CurrentBar}: [CISD] TP {tp:F2} <= Entry {entry:F2} — reset."); setupState = S.Scanning; return; }
+                if (tp <= entry)
+                { D($"Bar {CurrentBar}: [CISD] TP {tp:F2} <= Entry {entry:F2} — reset."); setupState = S.Scanning; return; }
             }
             else
             {
                 sl = sweep2Extreme + SlBufferTicks * TickSize;
                 tp = legEndPrice;
-                if (tp >= entry) { D($"Bar {CurrentBar}: [CISD] TP {tp:F2} >= Entry {entry:F2} — reset."); setupState = S.Scanning; return; }
+                if (tp >= entry)
+                { D($"Bar {CurrentBar}: [CISD] TP {tp:F2} >= Entry {entry:F2} — reset."); setupState = S.Scanning; return; }
             }
 
             int qty = CalcContracts(entry, sl);
@@ -447,24 +466,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             setupState = S.Scanning;
         }
 
-        // ─── Helpers ───────────────────────────────────────────────────────
+        // ─── Helpers ─────────────────────────────────────────────────────────
 
         private double FindReactionLevel(int s1Bar, int s2Bar, bool isBull)
         {
             double level = isBull ? double.MinValue : double.MaxValue;
-
             for (int abs = s1Bar + 1; abs < s2Bar; abs++)
             {
                 int barsAgo = CurrentBar - abs;
                 if (barsAgo < 0 || barsAgo >= CurrentBar) continue;
-
                 if (isBull  && High[barsAgo] > level) level = High[barsAgo];
                 if (!isBull && Low[barsAgo]  < level) level = Low[barsAgo];
             }
-
             if (isBull  && level == double.MinValue) level = High[CurrentBar - s1Bar];
             if (!isBull && level == double.MaxValue) level = Low[CurrentBar - s1Bar];
-
             return level;
         }
 
@@ -474,7 +489,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 int ba = CurrentBar - abs;
                 if (ba < 0 || ba >= CurrentBar) continue;
-
                 if (isBull  && Low[ba]  < eq && ExecIsSwingLowAt(ba,  ExtSwingStrength)) return Low[ba];
                 if (!isBull && High[ba] > eq && ExecIsSwingHighAt(ba, ExtSwingStrength)) return High[ba];
             }
@@ -520,31 +534,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             double r = Low[n];
             for (int i = 1; i <= n; i++)
                 if (Low[n - i] <= r || Low[n + i] <= r) return false;
-            return true;
-        }
-
-        private bool Bias4HIsSwingHigh(int n, int bars1)
-        {
-            // bars1 = BarsArray[1].Count — authoritative available bar count for series 1
-            if (bars1 < n * 2 + 1) return false;
-            double r = Highs[1][n];
-            for (int i = 1; i <= n; i++)
-            {
-                if (n + i >= bars1) return false; // safety: don't exceed available bars
-                if (Highs[1][n - i] >= r || Highs[1][n + i] >= r) return false;
-            }
-            return true;
-        }
-
-        private bool Bias4HIsSwingLow(int n, int bars1)
-        {
-            if (bars1 < n * 2 + 1) return false;
-            double r = Lows[1][n];
-            for (int i = 1; i <= n; i++)
-            {
-                if (n + i >= bars1) return false;
-                if (Lows[1][n - i] <= r || Lows[1][n + i] <= r) return false;
-            }
             return true;
         }
 
