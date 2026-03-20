@@ -1,13 +1,11 @@
-// NinjatraderV1.cs
+// NinjatraderV1.cs  — v2
 // ICT Price Leg Strategy for NQ Futures — NinjaTrader 8
 //
-// Logic:
-//   1. 4H bias  : Last unbalanced price leg (balanced = 50% EQ revisited)
-//   2. 1M setup : Externes Low sweep -> Inverse FVG -> CISD close -> Long entry
-//
-// How to install:
-//   Tools > Import > NinjaScript Add-On > select this file
-//   OR: copy to Documents\NinjaTrader 8\bin\Custom\Strategies\
+// Fixes vs v1:
+//   - MaximumBarsLookBack = Infinite (prevents out-of-range on deep lookbacks)
+//   - Bias bar count now uses CurrentBar (which is series-relative in BarsInProgress==1 context)
+//   - All series accesses guarded with explicit bounds checks
+//   - Debug output to NinjaTrader Output window (enable via parameter)
 
 #region Using declarations
 using System;
@@ -26,87 +24,80 @@ namespace NinjaTrader.NinjaScript.Strategies
     {
         // ─── Parameters ────────────────────────────────────────────────────
 
-        [NinjaScriptProperty]
-        [Range(1, 20)]
-        [Display(Name = "Swing Strength (Exec TF)", Order = 1, GroupName = "Leg Detection")]
+        [NinjaScriptProperty][Range(1,20)]
+        [Display(Name="Swing Strength (Exec TF)",     Order=1, GroupName="Leg Detection")]
         public int SwingStrength { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(1, 10)]
-        [Display(Name = "Externes Level Swing Strength", Order = 2, GroupName = "Leg Detection")]
+        [NinjaScriptProperty][Range(1,10)]
+        [Display(Name="Externes Level Swing Strength",Order=2, GroupName="Leg Detection")]
         public int ExtSwingStrength { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(5, 200)]
-        [Display(Name = "Min Leg Bars (Exec TF)", Order = 3, GroupName = "Leg Detection")]
+        [NinjaScriptProperty][Range(5,500)]
+        [Display(Name="Min Leg Bars (Exec TF)",       Order=3, GroupName="Leg Detection")]
         public int MinLegBars { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(3, 50)]
-        [Display(Name = "Min Leg Bars (Bias TF)", Order = 4, GroupName = "Leg Detection")]
+        [NinjaScriptProperty][Range(3,50)]
+        [Display(Name="Min Leg Bars (Bias TF)",       Order=4, GroupName="Leg Detection")]
         public int BiasMinLegBars { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(1, 20)]
-        [Display(Name = "Bias Swing Strength", Order = 5, GroupName = "Leg Detection")]
+        [NinjaScriptProperty][Range(1,20)]
+        [Display(Name="Bias Swing Strength",          Order=5, GroupName="Leg Detection")]
         public int BiasSwingStrength { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(240, 240)]
-        [Display(Name = "Bias Timeframe (Minutes)", Order = 6, GroupName = "Leg Detection",
-            Description = "Higher timeframe for bias. Default: 240 = 4H")]
+        [NinjaScriptProperty][Range(60,1440)]
+        [Display(Name="Bias Timeframe (Minutes)",     Order=6, GroupName="Leg Detection",
+            Description="240 = 4H")]
         public int BiasTFMinutes { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(1, 30)]
-        [Display(Name = "CISD / FVG Window (Bars)", Order = 1, GroupName = "Entry Rules")]
+        [NinjaScriptProperty][Range(1,30)]
+        [Display(Name="CISD / FVG Window (Bars)",     Order=1, GroupName="Entry Rules")]
         public int CisdFvgWindow { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(1, 10)]
-        [Display(Name = "FVG Inverse Window (Bars)", Order = 2, GroupName = "Entry Rules")]
+        [NinjaScriptProperty][Range(1,10)]
+        [Display(Name="FVG Inverse Window (Bars)",    Order=2, GroupName="Entry Rules")]
         public int FvgInverseWindow { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(0, 100)]
-        [Display(Name = "SL Buffer (Ticks)", Order = 3, GroupName = "Entry Rules")]
+        [NinjaScriptProperty][Range(0,100)]
+        [Display(Name="SL Buffer (Ticks)",            Order=3, GroupName="Entry Rules")]
         public int SlBufferTicks { get; set; }
 
-        [NinjaScriptProperty]
-        [Range(0.1, 10.0)]
-        [Display(Name = "Risk Per Trade (%)", Order = 4, GroupName = "Entry Rules")]
+        [NinjaScriptProperty][Range(0.1,10.0)]
+        [Display(Name="Risk Per Trade (%)",           Order=4, GroupName="Entry Rules")]
         public double RiskPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Debug Mode",                   Order=1, GroupName="Debug",
+            Description="Print strategy state to NinjaTrader Output window")]
+        public bool DebugMode { get; set; }
 
         // ─── State machine ─────────────────────────────────────────────────
 
-        private enum State4 { Scanning, WaitingSweep, WaitingFVG, WaitingCISD }
-        private State4 setupState;
+        private enum S { Scanning, WaitingSweep, WaitingFVG, WaitingCISD }
+        private S setupState;
 
-        // Active leg info
+        // Active leg
         private double legStartPrice, legEndPrice, legEq;
         private int    legStartBar,   legEndBar;
         private bool   legIsBull;
-
-        // Externes level
         private double activeExtLevel;
 
-        // Sweep info
+        // Sweep
         private int    sweepBar;
-        private double sweepExtreme;   // low (bull) or high (bear) of sweep bar
+        private double sweepExtreme;
 
-        // FVG info
+        // FVG
         private double fvgTop, fvgBottom;
         private int    fvgFoundBar;
 
-        // Current bias from 4H
-        private bool   biasIsBull;
-        private bool   biasAvailable;
+        // Bias
+        private bool biasIsBull;
+        private bool biasAvailable;
 
-        // Swing point lists — exec TF (absolute CurrentBar indices)
+        // Swing lists — exec TF (absolute CurrentBar values)
         private List<int>    execShBars,   execSlBars;
         private List<double> execShPrices, execSlPrices;
 
-        // Swing point lists — bias TF (absolute BarsArray[1] bar indices)
+        // Swing lists — bias TF (absolute CurrentBar values when BarsInProgress==1)
         private List<int>    biasShBars,   biasSlBars;
         private List<double> biasShPrices, biasSlPrices;
 
@@ -116,26 +107,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Name                        = "NinjatraderV1";
-                Description                 = "ICT Price Leg Strategy — NQ Futures\n" +
-                                              "4H Bias + Externes Low Sweep + iFVG + CISD";
-                Calculate                   = Calculate.OnBarClose;
-                EntriesPerDirection         = 1;
-                EntryHandling               = EntryHandling.AllEntries;
+                Name                         = "NinjatraderV1";
+                Description                  = "ICT Price Leg Strategy v2 — NQ Futures";
+                Calculate                    = Calculate.OnBarClose;
+                EntriesPerDirection          = 1;
+                EntryHandling                = EntryHandling.AllEntries;
                 IsExitOnSessionCloseStrategy = true;
-                ExitOnSessionCloseSeconds   = 30;
+                ExitOnSessionCloseSeconds    = 30;
+                MaximumBarsLookBack          = MaximumBarsLookBackInfinite; // needed for deep leg lookbacks
 
-                // Defaults
-                SwingStrength    = 3;
-                ExtSwingStrength = 2;
-                MinLegBars       = 25;
-                BiasMinLegBars   = 8;
+                SwingStrength     = 3;
+                ExtSwingStrength  = 2;
+                MinLegBars        = 25;
+                BiasMinLegBars    = 8;
                 BiasSwingStrength = 3;
-                BiasTFMinutes    = 240;
-                CisdFvgWindow    = 10;
-                FvgInverseWindow = 4;
-                SlBufferTicks    = 20;
-                RiskPercent      = 1.0;
+                BiasTFMinutes     = 240;
+                CisdFvgWindow     = 10;
+                FvgInverseWindow  = 4;
+                SlBufferTicks     = 20;
+                RiskPercent       = 1.0;
+                DebugMode         = true;
             }
             else if (State == State.Configure)
             {
@@ -143,19 +134,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.DataLoaded)
             {
-                setupState = State4.Scanning;
+                setupState = S.Scanning;
 
-                execShBars   = new List<int>();
-                execShPrices = new List<double>();
-                execSlBars   = new List<int>();
-                execSlPrices = new List<double>();
-
-                biasShBars   = new List<int>();
-                biasShPrices = new List<double>();
-                biasSlBars   = new List<int>();
-                biasSlPrices = new List<double>();
+                execShBars   = new List<int>(); execShPrices = new List<double>();
+                execSlBars   = new List<int>(); execSlPrices = new List<double>();
+                biasShBars   = new List<int>(); biasShPrices = new List<double>();
+                biasSlBars   = new List<int>(); biasSlPrices = new List<double>();
 
                 biasAvailable = false;
+                D("Strategy DataLoaded — waiting for bias bars.");
             }
         }
 
@@ -163,32 +150,39 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
-            // ── Bias TF: track swings ──────────────────────────────────────
+            // ── Bias TF ────────────────────────────────────────────────────
             if (BarsInProgress == 1)
             {
-                UpdateBiasSwings();
-                UpdateBias();
+                // CurrentBar here is the 4H series bar index
+                if (CurrentBar < BiasSwingStrength * 2) return;
+                UpdateBiasSwings();   // detect 4H swing points
+                UpdateBias();         // re-derive current bias direction
                 return;
             }
 
-            // ── Exec TF only below ─────────────────────────────────────────
+            // ── Primary TF (exec) ──────────────────────────────────────────
             if (BarsInProgress != 0) return;
-            if (CurrentBar < Math.Max(SwingStrength * 2, MinLegBars) + 10) return;
+
+            int minWarmup = Math.Max(SwingStrength * 2, MinLegBars) + 10;
+            if (CurrentBar < minWarmup) return;
 
             UpdateExecSwings();
 
-            if (!biasAvailable) return;
+            if (!biasAvailable)
+            {
+                if (DebugMode && CurrentBar % 500 == 0)
+                    D($"Bar {CurrentBar}: bias not yet available");
+                return;
+            }
 
-            // Manage open position: NT handles SL/TP automatically via SetStopLoss/SetProfitTarget
-            // Just run the setup state machine when flat
             if (Position.MarketPosition != MarketPosition.Flat) return;
 
             switch (setupState)
             {
-                case State4.Scanning:      RunScanning();      break;
-                case State4.WaitingSweep:  RunWaitingSweep();  break;
-                case State4.WaitingFVG:    RunWaitingFVG();    break;
-                case State4.WaitingCISD:   RunWaitingCISD();   break;
+                case S.Scanning:     RunScanning();     break;
+                case S.WaitingSweep: RunWaitingSweep(); break;
+                case S.WaitingFVG:   RunWaitingFVG();   break;
+                case S.WaitingCISD:  RunWaitingCISD();  break;
             }
         }
 
@@ -198,92 +192,101 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (CurrentBar < SwingStrength * 2) return;
 
-            if (IsSwingHighExec(SwingStrength))
+            if (ExecIsSwingHigh(SwingStrength))
             {
                 int bar = CurrentBar - SwingStrength;
                 if (execShBars.Count == 0 || execShBars[execShBars.Count - 1] != bar)
                 {
                     execShBars.Add(bar);
                     execShPrices.Add(High[SwingStrength]);
+                    D($"  [EXEC] Swing HIGH @ bar {bar} price {High[SwingStrength]:F2}");
                 }
             }
-            if (IsSwingLowExec(SwingStrength))
+            if (ExecIsSwingLow(SwingStrength))
             {
                 int bar = CurrentBar - SwingStrength;
                 if (execSlBars.Count == 0 || execSlBars[execSlBars.Count - 1] != bar)
                 {
                     execSlBars.Add(bar);
                     execSlPrices.Add(Low[SwingStrength]);
+                    D($"  [EXEC] Swing LOW  @ bar {bar} price {Low[SwingStrength]:F2}");
                 }
             }
         }
 
-        private bool IsSwingHighExec(int n)
+        // Primary series swing helpers (use High[] / Low[])
+        private bool ExecIsSwingHigh(int n)
         {
-            double refH = High[n];
+            if (CurrentBar < n * 2) return false;
+            double r = High[n];
             for (int i = 1; i <= n; i++)
-                if (High[n - i] >= refH || High[n + i] >= refH) return false;
+                if (High[n - i] >= r || High[n + i] >= r) return false;
             return true;
         }
-
-        private bool IsSwingLowExec(int n)
+        private bool ExecIsSwingLow(int n)
         {
-            double refL = Low[n];
+            if (CurrentBar < n * 2) return false;
+            double r = Low[n];
             for (int i = 1; i <= n; i++)
-                if (Low[n - i] <= refL || Low[n + i] <= refL) return false;
+                if (Low[n - i] <= r || Low[n + i] <= r) return false;
             return true;
         }
 
         private void UpdateBiasSwings()
         {
-            if (BarsArray[1].Count < BiasSwingStrength * 2 + 1) return;
+            // CurrentBar = 4H bar index in this context (BarsInProgress==1)
+            if (CurrentBar < BiasSwingStrength * 2) return;
 
-            if (IsBiasSwingHigh(BiasSwingStrength))
+            if (BiasIsSwingHigh(BiasSwingStrength))
             {
-                int bar = BarsArray[1].Count - 1 - BiasSwingStrength;
+                int bar = CurrentBar - BiasSwingStrength;
                 if (biasShBars.Count == 0 || biasShBars[biasShBars.Count - 1] != bar)
                 {
                     biasShBars.Add(bar);
                     biasShPrices.Add(Highs[1][BiasSwingStrength]);
+                    D($"  [BIAS] Swing HIGH @ 4H bar {bar} price {Highs[1][BiasSwingStrength]:F2}");
                 }
             }
-            if (IsBiasSwingLow(BiasSwingStrength))
+            if (BiasIsSwingLow(BiasSwingStrength))
             {
-                int bar = BarsArray[1].Count - 1 - BiasSwingStrength;
+                int bar = CurrentBar - BiasSwingStrength;
                 if (biasSlBars.Count == 0 || biasSlBars[biasSlBars.Count - 1] != bar)
                 {
                     biasSlBars.Add(bar);
                     biasSlPrices.Add(Lows[1][BiasSwingStrength]);
+                    D($"  [BIAS] Swing LOW  @ 4H bar {bar} price {Lows[1][BiasSwingStrength]:F2}");
                 }
             }
         }
 
-        private bool IsBiasSwingHigh(int n)
+        // Bias series swing helpers (use Highs[1][] / Lows[1][])
+        // MUST only be called when BarsInProgress==1 and CurrentBar >= n*2
+        private bool BiasIsSwingHigh(int n)
         {
-            double refH = Highs[1][n];
+            if (CurrentBar < n * 2) return false;
+            double r = Highs[1][n];
             for (int i = 1; i <= n; i++)
-                if (Highs[1][n - i] >= refH || Highs[1][n + i] >= refH) return false;
+                if (Highs[1][n - i] >= r || Highs[1][n + i] >= r) return false;
+            return true;
+        }
+        private bool BiasIsSwingLow(int n)
+        {
+            if (CurrentBar < n * 2) return false;
+            double r = Lows[1][n];
+            for (int i = 1; i <= n; i++)
+                if (Lows[1][n - i] <= r || Lows[1][n + i] <= r) return false;
             return true;
         }
 
-        private bool IsBiasSwingLow(int n)
-        {
-            double refL = Lows[1][n];
-            for (int i = 1; i <= n; i++)
-                if (Lows[1][n - i] <= refL || Lows[1][n + i] <= refL) return false;
-            return true;
-        }
-
-        // ─── Bias detection ────────────────────────────────────────────────
+        // ─── Bias ──────────────────────────────────────────────────────────
 
         private void UpdateBias()
         {
-            // Build merged + cleaned swing sequence from 4H data
+            // BarsInProgress==1 context: CurrentBar = 4H bar index
+            int cur4H = CurrentBar;
+
             var merged = BuildMergedSwings(biasShBars, biasShPrices, biasSlBars, biasSlPrices);
             if (merged.Count < 2) return;
-
-            // Find last unbalanced leg (or fallback to last leg)
-            int totalBias4hBars = BarsArray[1].Count;
 
             for (int i = merged.Count - 2; i >= 0; i--)
             {
@@ -291,31 +294,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var e = merged[i + 1];
                 if (e.BarIdx - s.BarIdx < BiasMinLegBars) continue;
 
-                bool isBull = (s.IsLow && !e.IsLow);
-                bool isBear = (!s.IsLow && e.IsLow);
+                bool isBull = s.IsLow && !e.IsLow;
+                bool isBear = !s.IsLow && e.IsLow;
                 if (!isBull && !isBear) continue;
 
-                double startP = s.Price;
-                double endP   = e.Price;
-                double eq     = (startP + endP) / 2.0;
+                double eq = (s.Price + e.Price) / 2.0;
 
-                // Check if balanced: did price revisit EQ after leg end?
+                // Check if balanced: did price revisit 50% after leg end?
                 bool balanced = false;
-                int legEndBarIdx = e.BarIdx;
-                int barsToCheck  = totalBias4hBars - 1 - legEndBarIdx;
-                for (int k = 1; k <= barsToCheck && k < BarsArray[1].Count; k++)
+                // k=1 means 1 bar after legEnd; loop while index stays in range
+                for (int k = 1; (e.BarIdx + k) <= cur4H; k++)
                 {
-                    if (isBull && Lows[1][BarsArray[1].Count - 1 - (legEndBarIdx + k)] <= eq)
-                    { balanced = true; break; }
-                    if (isBear && Highs[1][BarsArray[1].Count - 1 - (legEndBarIdx + k)] >= eq)
-                    { balanced = true; break; }
+                    int barsAgo = cur4H - (e.BarIdx + k); // guaranteed >= 0
+                    if (isBull && Lows[1][barsAgo]  <= eq) { balanced = true; break; }
+                    if (isBear && Highs[1][barsAgo] >= eq) { balanced = true; break; }
                 }
 
-                // Use this leg (even if balanced — fallback)
+                // Use this leg (unbalanced = ideal; balanced = fallback)
                 biasIsBull    = isBull;
                 biasAvailable = true;
 
-                if (!balanced) break; // unbalanced found — use it and stop
+                D($"  [BIAS] Leg {(isBull?"BULL":"BEAR")} {s.Price:F0}->{e.Price:F0} EQ={eq:F0} balanced={balanced}");
+
+                if (!balanced) break; // unbalanced found — stop here
             }
         }
 
@@ -323,7 +324,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void RunScanning()
         {
-            // Find last unbalanced exec TF leg aligned with bias
             var merged = BuildMergedSwings(execShBars, execShPrices, execSlBars, execSlPrices);
             if (merged.Count < 2) return;
 
@@ -333,68 +333,66 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var e = merged[i + 1];
                 if (e.BarIdx - s.BarIdx < MinLegBars) continue;
 
-                bool legBull = (s.IsLow && !e.IsLow);
-                bool legBear = (!s.IsLow && e.IsLow);
+                bool legBull = s.IsLow && !e.IsLow;
+                bool legBear = !s.IsLow && e.IsLow;
                 if (!legBull && !legBear) continue;
 
                 // Must align with bias
                 if (legBull != biasIsBull) continue;
 
-                double startP = s.Price, endP = e.Price;
-                double eq     = (startP + endP) / 2.0;
+                double eq = (s.Price + e.Price) / 2.0;
 
-                // Check if balanced
-                int afterEnd = CurrentBar - e.BarIdx;
+                // Check if balanced already
                 bool balanced = false;
-                for (int k = 1; k < afterEnd; k++)
+                for (int k = 1; (e.BarIdx + k) <= CurrentBar; k++)
                 {
                     int barsAgo = CurrentBar - (e.BarIdx + k);
                     if (barsAgo < 0) break;
-                    if (legBull && Low[barsAgo] <= eq)  { balanced = true; break; }
+                    if (legBull && Low[barsAgo]  <= eq) { balanced = true; break; }
                     if (legBear && High[barsAgo] >= eq) { balanced = true; break; }
                 }
-                if (balanced) continue; // look for a more recent unbalanced leg
+                if (balanced) continue;
 
-                // Find externes level within this leg in discount (bull) / premium (bear)
-                double extLevel = FindExterneLevel(e.BarIdx, s.BarIdx, legBull, startP, endP, eq);
-                if (double.IsNaN(extLevel)) continue; // no externe level found
+                // Find externe level inside the leg
+                double extLevel = FindExterneLevel(s.BarIdx, e.BarIdx, legBull, eq);
+                if (double.IsNaN(extLevel)) continue;
 
-                // All conditions met — activate this leg
-                legStartPrice  = startP;
-                legEndPrice    = endP;
+                // Activate setup
+                legStartPrice  = s.Price;
+                legEndPrice    = e.Price;
                 legEq          = eq;
                 legStartBar    = s.BarIdx;
                 legEndBar      = e.BarIdx;
                 legIsBull      = legBull;
                 activeExtLevel = extLevel;
+                setupState     = S.WaitingSweep;
 
-                setupState = State4.WaitingSweep;
+                D($"Bar {CurrentBar}: [SCAN] Leg found {(legBull?"BULL":"BEAR")} " +
+                  $"{s.Price:F0}->{e.Price:F0} EQ={eq:F0} | ExtLevel={extLevel:F2}");
                 break;
             }
         }
 
         private void RunWaitingSweep()
         {
-            // Only look for sweep after the leg has ended
             if (CurrentBar <= legEndBar) return;
 
-            // Re-validate: if leg is now balanced, reset
-            int afterEnd = CurrentBar - legEndBar;
-            for (int k = 1; k < afterEnd; k++)
+            // Invalidate if leg is now balanced
+            for (int k = 1; (legEndBar + k) < CurrentBar; k++)
             {
                 int barsAgo = CurrentBar - (legEndBar + k);
-                if (barsAgo < 0) break;
-                if (legIsBull  && Low[barsAgo]  <= legEq) { setupState = State4.Scanning; return; }
-                if (!legIsBull && High[barsAgo] >= legEq) { setupState = State4.Scanning; return; }
+                if (barsAgo <= 0) break;
+                if (legIsBull  && Low[barsAgo]  <= legEq) { D($"Bar {CurrentBar}: [SWEEP] Leg balanced — reset."); setupState = S.Scanning; return; }
+                if (!legIsBull && High[barsAgo] >= legEq) { D($"Bar {CurrentBar}: [SWEEP] Leg balanced — reset."); setupState = S.Scanning; return; }
             }
 
-            // Check if current bar sweeps the externe level
             bool swept = legIsBull ? Low[0] < activeExtLevel : High[0] > activeExtLevel;
             if (swept)
             {
-                sweepBar      = CurrentBar;
-                sweepExtreme  = legIsBull ? Low[0] : High[0];
-                setupState    = State4.WaitingFVG;
+                sweepBar     = CurrentBar;
+                sweepExtreme = legIsBull ? Low[0] : High[0];
+                setupState   = S.WaitingFVG;
+                D($"Bar {CurrentBar}: [SWEEP] ExtLevel {activeExtLevel:F2} swept! extreme={sweepExtreme:F2}");
             }
         }
 
@@ -403,38 +401,39 @@ namespace NinjaTrader.NinjaScript.Strategies
             int barsSinceSweep = CurrentBar - sweepBar;
             if (barsSinceSweep > CisdFvgWindow)
             {
-                setupState = State4.Scanning;
+                D($"Bar {CurrentBar}: [FVG] Timeout after {barsSinceSweep} bars — reset.");
+                setupState = S.Scanning;
                 return;
             }
 
             if (CurrentBar < sweepBar + 2) return;
 
-            // Detect FVG on current bar (confirmed 3-candle pattern)
-            // Bull FVG: High[2] < Low[0]  (gap between 2-bars-ago high and current low)
-            // Bear FVG: Low[2]  > High[0]
+            // Bullish FVG: High[2] < Low[0]
+            // Bearish FVG: Low[2]  > High[0]
             if (legIsBull && High[2] < Low[0])
             {
-                fvgBottom    = High[2];
-                fvgTop       = Low[0];
-                fvgFoundBar  = CurrentBar;
-                setupState   = State4.WaitingCISD;
+                fvgBottom   = High[2];
+                fvgTop      = Low[0];
+                fvgFoundBar = CurrentBar;
+                setupState  = S.WaitingCISD;
+                D($"Bar {CurrentBar}: [FVG] Bullish iFVG found: {fvgBottom:F2}-{fvgTop:F2}");
             }
             else if (!legIsBull && Low[2] > High[0])
             {
-                fvgTop       = Low[2];
-                fvgBottom    = High[0];
-                fvgFoundBar  = CurrentBar;
-                setupState   = State4.WaitingCISD;
+                fvgTop      = Low[2];
+                fvgBottom   = High[0];
+                fvgFoundBar = CurrentBar;
+                setupState  = S.WaitingCISD;
+                D($"Bar {CurrentBar}: [FVG] Bearish iFVG found: {fvgBottom:F2}-{fvgTop:F2}");
             }
         }
 
         private void RunWaitingCISD()
         {
-            int barsSinceFvg = CurrentBar - fvgFoundBar;
-            if (barsSinceFvg > FvgInverseWindow)
+            if (CurrentBar - fvgFoundBar > FvgInverseWindow)
             {
-                // Timeout — go back and look for another FVG in the same sweep window
-                setupState = State4.WaitingFVG;
+                D($"Bar {CurrentBar}: [CISD] Timeout — back to WaitingFVG.");
+                setupState = S.WaitingFVG;
                 return;
             }
 
@@ -443,104 +442,94 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (!cisdBull && !cisdBear) return;
 
-            double entryPrice = Close[0];
-            double slPrice, tpPrice;
+            double entry = Close[0];
+            double sl, tp;
 
             if (legIsBull)
             {
-                slPrice = sweepExtreme - SlBufferTicks * TickSize;
-                tpPrice = legEndPrice;
-                if (tpPrice <= entryPrice) { setupState = State4.Scanning; return; }
+                sl = sweepExtreme - SlBufferTicks * TickSize;
+                tp = legEndPrice;
+                if (tp <= entry) { D($"Bar {CurrentBar}: [CISD] TP <= Entry — skip."); setupState = S.Scanning; return; }
             }
             else
             {
-                slPrice = sweepExtreme + SlBufferTicks * TickSize;
-                tpPrice = legEndPrice;
-                if (tpPrice >= entryPrice) { setupState = State4.Scanning; return; }
+                sl = sweepExtreme + SlBufferTicks * TickSize;
+                tp = legEndPrice;
+                if (tp >= entry) { D($"Bar {CurrentBar}: [CISD] TP >= Entry (short) — skip."); setupState = S.Scanning; return; }
             }
 
-            int qty = CalcContracts(entryPrice, slPrice);
+            int qty = CalcContracts(entry, sl);
             if (qty < 1) qty = 1;
 
-            // Set SL/TP before entry
-            SetStopLoss("ICT",  CalculationMode.Price, slPrice, false);
-            SetProfitTarget("ICT", CalculationMode.Price, tpPrice);
+            SetStopLoss  ("ICT", CalculationMode.Price, sl, false);
+            SetProfitTarget("ICT", CalculationMode.Price, tp);
 
             if (legIsBull)
+            {
                 EnterLong(qty, "ICT");
+                D($"Bar {CurrentBar}: *** ENTER LONG {qty}ct @ {entry:F2}  SL={sl:F2}  TP={tp:F2}  R={(tp-entry)/(entry-sl):F1}R ***");
+            }
             else
+            {
                 EnterShort(qty, "ICT");
+                D($"Bar {CurrentBar}: *** ENTER SHORT {qty}ct @ {entry:F2}  SL={sl:F2}  TP={tp:F2}  R={(entry-tp)/(sl-entry):F1}R ***");
+            }
 
-            setupState = State4.Scanning; // reset to look for next setup after this trade closes
+            setupState = S.Scanning;
         }
 
         // ─── Helpers ───────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Find the first externe level within the price leg that is in
-        /// discount (bull leg) or premium (bear leg) zone.
-        /// Returns NaN if none found.
-        /// </summary>
-        private double FindExterneLevel(int legEndBarAbs, int legStartBarAbs, bool isBull,
-                                         double startPrice, double endPrice, double eq)
+        private double FindExterneLevel(int legStartAbs, int legEndAbs, bool isBull, double eq)
         {
-            // Scan bars inside the leg for swing lows (bull) or highs (bear)
-            // Must be in discount (below eq) for bull, premium (above eq) for bear
-            for (int absBar = legStartBarAbs + ExtSwingStrength;
-                     absBar <= legEndBarAbs - ExtSwingStrength;
-                     absBar++)
+            // Scan bars inside the leg for swing lows (bull) / highs (bear) in discount/premium
+            for (int abs = legStartAbs + ExtSwingStrength; abs <= legEndAbs - ExtSwingStrength; abs++)
             {
-                int barsAgo = CurrentBar - absBar;
-                if (barsAgo < 0 || barsAgo >= CurrentBar) continue;
+                int barsAgo = CurrentBar - abs;
+                if (barsAgo < 0 || barsAgo > CurrentBar) continue;
 
                 if (isBull)
                 {
-                    double price = Low[barsAgo];
-                    if (price >= eq) continue; // must be in discount
-                    if (IsSwingLowAt(barsAgo, ExtSwingStrength))
-                        return price;
+                    if (Low[barsAgo] >= eq) continue; // must be in discount
+                    if (ExecIsSwingLowAt(barsAgo, ExtSwingStrength))
+                        return Low[barsAgo];
                 }
                 else
                 {
-                    double price = High[barsAgo];
-                    if (price <= eq) continue; // must be in premium
-                    if (IsSwingHighAt(barsAgo, ExtSwingStrength))
-                        return price;
+                    if (High[barsAgo] <= eq) continue; // must be in premium
+                    if (ExecIsSwingHighAt(barsAgo, ExtSwingStrength))
+                        return High[barsAgo];
                 }
             }
             return double.NaN;
         }
 
-        private bool IsSwingHighAt(int barsAgo, int n)
+        private bool ExecIsSwingHighAt(int barsAgo, int n)
         {
-            double refH = High[barsAgo];
+            double r = High[barsAgo];
             for (int i = 1; i <= n; i++)
             {
-                int agoMinus = barsAgo - i; // more recent
-                int agoPlus  = barsAgo + i; // older
-                if (agoMinus < 0 || agoPlus >= CurrentBar) return false;
-                if (High[agoMinus] >= refH || High[agoPlus] >= refH) return false;
+                int older  = barsAgo + i;
+                int newer  = barsAgo - i;
+                if (newer < 0 || older > CurrentBar) return false;
+                if (High[newer] >= r || High[older] >= r) return false;
             }
             return true;
         }
 
-        private bool IsSwingLowAt(int barsAgo, int n)
+        private bool ExecIsSwingLowAt(int barsAgo, int n)
         {
-            double refL = Low[barsAgo];
+            double r = Low[barsAgo];
             for (int i = 1; i <= n; i++)
             {
-                int agoMinus = barsAgo - i;
-                int agoPlus  = barsAgo + i;
-                if (agoMinus < 0 || agoPlus >= CurrentBar) return false;
-                if (Low[agoMinus] <= refL || Low[agoPlus] <= refL) return false;
+                int older = barsAgo + i;
+                int newer = barsAgo - i;
+                if (newer < 0 || older > CurrentBar) return false;
+                if (Low[newer] <= r || Low[older] <= r) return false;
             }
             return true;
         }
 
-        /// <summary>
-        /// Merge and clean swing high/low lists into an alternating sequence.
-        /// Consecutive same-type entries are resolved by keeping the more extreme.
-        /// </summary>
         private List<SwingPoint> BuildMergedSwings(
             List<int> shBars, List<double> shPrices,
             List<int> slBars, List<double> slPrices)
@@ -552,47 +541,41 @@ namespace NinjaTrader.NinjaScript.Strategies
                 all.Add(new SwingPoint(slBars[i], slPrices[i], true));
             all.Sort((a, b) => a.BarIdx.CompareTo(b.BarIdx));
 
-            var cleaned = new List<SwingPoint>();
+            var clean = new List<SwingPoint>();
             foreach (var sp in all)
             {
-                if (cleaned.Count > 0 && cleaned[cleaned.Count - 1].IsLow == sp.IsLow)
+                if (clean.Count > 0 && clean[clean.Count - 1].IsLow == sp.IsLow)
                 {
-                    var prev = cleaned[cleaned.Count - 1];
-                    if (sp.IsLow && sp.Price < prev.Price)
-                        cleaned[cleaned.Count - 1] = sp;
-                    else if (!sp.IsLow && sp.Price > prev.Price)
-                        cleaned[cleaned.Count - 1] = sp;
+                    var prev = clean[clean.Count - 1];
+                    if (sp.IsLow  && sp.Price < prev.Price) clean[clean.Count - 1] = sp;
+                    if (!sp.IsLow && sp.Price > prev.Price) clean[clean.Count - 1] = sp;
                 }
-                else
-                {
-                    cleaned.Add(sp);
-                }
+                else clean.Add(sp);
             }
-            return cleaned;
+            return clean;
         }
 
         private int CalcContracts(double entry, double sl)
         {
-            double riskUsd     = Account.Get(AccountItem.CashValue, Currency.UsDollar) * (RiskPercent / 100.0);
+            double accountVal  = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+            double riskUsd     = accountVal * (RiskPercent / 100.0);
             double riskPerCont = Math.Abs(entry - sl) * Instrument.MasterInstrument.PointValue;
             if (riskPerCont <= 0) return 1;
             return Math.Max(1, (int)(riskUsd / riskPerCont));
         }
 
-        // ─── Nested helper struct ──────────────────────────────────────────
+        // Debug helper — only prints when DebugMode is enabled
+        private void D(string msg)
+        {
+            if (DebugMode) Print(msg);
+        }
+
+        // ─── Nested struct ─────────────────────────────────────────────────
 
         private struct SwingPoint
         {
-            public int    BarIdx;
-            public double Price;
-            public bool   IsLow;
-
-            public SwingPoint(int bar, double price, bool isLow)
-            {
-                BarIdx = bar;
-                Price  = price;
-                IsLow  = isLow;
-            }
+            public int BarIdx; public double Price; public bool IsLow;
+            public SwingPoint(int b, double p, bool l) { BarIdx=b; Price=p; IsLow=l; }
         }
     }
 }
