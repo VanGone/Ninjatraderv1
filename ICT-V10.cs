@@ -1,22 +1,25 @@
-// ICT-V9.cs
+// ICT-V10.cs
 // ICT Price Leg Strategy for NQ Futures — NinjaTrader 8
 //
 // ╔══════════════════════════════════════╗
-// ║  VERSION: v9                         ║
+// ║  VERSION: v10                        ║
 // ║  DATE:    2026-03-20                 ║
 // ╚══════════════════════════════════════╝
 //
-// v9 fixes (vs v8):
-//   - BUGFIX: SCAN→S1 Timeout infinite loop with stale legs.
-//     When bias first activates, RunScanning found old legs whose
-//     end bar was already > Sweep1Timeout bars ago.  The loop:
-//       Scan → WaitingSweep1 → Timeout (1 bar later) → Scan → repeat
-//     blocked the strategy for hundreds/thousands of bars.
-//     Fix: add freshness guard in RunScanning:
-//       if (CurrentBar - e.BarIdx > Sweep1Timeout) continue;
-//     Only legs that ended recently (within the timeout window)
-//     are eligible setups.
+// v10 fixes (vs v9):
+//   - BUGFIX: SCAN→"Price below leg bottom" infinite loop.
+//     After bias activates, RunScanning found a valid leg, entered
+//     WaitingSweep1.  The very next bar: Low[0] < legEndPrice (price
+//     broke through the leg's SL) → "Price below leg bottom" reset →
+//     back to Scanning → same leg found again → repeat every 2 bars.
+//     Root cause: the balanced-check only tested price vs EQ, not vs
+//     the leg endpoints.  A leg should also be invalidated if price
+//     breaks THROUGH the leg end (below SL for bear, above SH for bull).
+//     Fix: extend the balanced-check in RunScanning:
+//       if (legBear && Low[ba]  <= e.Price) { balanced = true; break; }
+//       if (legBull && High[ba] >= e.Price) { balanced = true; break; }
 //
+// v9: added freshness guard (CurrentBar - e.BarIdx > Sweep1Timeout)
 // v8: removed Daily series, fix Highs[2][1] OOB crash
 // v7: eliminated Highs[1][n] variable-index access (local list fix)
 // v6: used BarsArray[1].Count — total history, not replay position
@@ -38,7 +41,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public class ICTV9 : Strategy
     {
-        private const string StrategyVersion = "v9";
+        private const string StrategyVersion = "v10";
 
         // ─── Parameters ────────────────────────────────────────────────────
 
@@ -126,8 +129,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Name                         = "ICTV9";
-                Description                  = "ICT Double Sweep + CISD — NQ Futures " + StrategyVersion;
+                Name                         = "ICTV10";
+                Description                  = "ICT Double Sweep + CISD — NQ Futures v10";
                 Calculate                    = Calculate.OnBarClose;
                 EntriesPerDirection          = 1;
                 EntryHandling                = EntryHandling.AllEntries;
@@ -169,7 +172,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 execSlBars   = new List<int>();    execSlPrices = new List<double>();
 
                 Print("================================================");
-                Print("  ICT-V9 loaded — ICT Double Sweep + CISD");
+                Print("  ICT-V10 loaded — ICT Double Sweep + CISD");
                 Print("  Bias: 4H Structure + Prev Day H/L (Option C)");
                 Print("================================================");
                 D("Waiting for bias data ...");
@@ -382,8 +385,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     int ba = CurrentBar - (e.BarIdx + k);
                     if (ba < 0) break;
-                    if (legBull && Low[ba]  <= eq) { balanced = true; break; }
-                    if (legBear && High[ba] >= eq) { balanced = true; break; }
+                    if (legBull && Low[ba]  <= eq)      { balanced = true; break; } // retraced to EQ
+                    if (legBull && High[ba] >= e.Price) { balanced = true; break; } // broke above SH top
+                    if (legBear && High[ba] >= eq)      { balanced = true; break; } // retraced to EQ
+                    if (legBear && Low[ba]  <= e.Price) { balanced = true; break; } // broke below SL bottom
                 }
                 if (balanced) continue;
 
