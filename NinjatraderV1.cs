@@ -47,8 +47,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description="240 = 4H")]
         public int BiasTFMinutes { get; set; }
 
+        [NinjaScriptProperty][Range(1,200)]
+        [Display(Name="Sweep1 Timeout (Bars)",         Order=1, GroupName="Entry Rules",
+            Description="Max bars after leg end to wait for Sweep1")]
+        public int Sweep1Timeout { get; set; }
+
         [NinjaScriptProperty][Range(1,50)]
-        [Display(Name="CISD Window (Bars after LL2)",  Order=1, GroupName="Entry Rules",
+        [Display(Name="CISD Window (Bars after LL2)",  Order=2, GroupName="Entry Rules",
             Description="Max bars after second sweep to find CISD close")]
         public int CisdWindow { get; set; }
 
@@ -126,6 +131,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MinLegBars       = 25;
                 BiasSwingStrength = 3;
                 BiasTFMinutes    = 240;
+                Sweep1Timeout    = 80;
                 CisdWindow       = 15;
                 SlBufferTicks    = 20;
                 RiskPercent      = 1.0;
@@ -353,23 +359,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (CurrentBar <= legEndBar) return;
 
-            // Invalidate if leg becomes balanced before sweep
-            for (int k = 1; (legEndBar + k) < CurrentBar; k++)
+            // Timeout
+            if (CurrentBar - legEndBar > Sweep1Timeout)
             {
-                int ba = CurrentBar - (legEndBar + k);
-                if (ba <= 0) break;
-                if (legIsBull  && Low[ba]  <= legEq) { D($"Bar {CurrentBar}: [S1] Leg balanced — reset."); setupState = S.Scanning; return; }
-                if (!legIsBull && High[ba] >= legEq) { D($"Bar {CurrentBar}: [S1] Leg balanced — reset."); setupState = S.Scanning; return; }
+                D($"Bar {CurrentBar}: [S1] Timeout — reset.");
+                setupState = S.Scanning; return;
             }
 
-            // Check sweep of Externe Low
+            // Invalidate only if price breaks THROUGH the leg top/bottom
+            // (do NOT check EQ balance here — the externe level is in discount/premium,
+            //  so price must cross EQ to reach it; that does NOT mean the setup is invalid)
+            if (legIsBull  && High[0] > legEndPrice) { D($"Bar {CurrentBar}: [S1] Price above leg top — reset."); setupState = S.Scanning; return; }
+            if (!legIsBull && Low[0]  < legEndPrice) { D($"Bar {CurrentBar}: [S1] Price below leg bottom — reset."); setupState = S.Scanning; return; }
+
+            // Check sweep of Externe Low / High
             bool swept = legIsBull ? Low[0] < activeExtLevel : High[0] > activeExtLevel;
             if (swept)
             {
                 sweep1Bar     = CurrentBar;
                 sweep1Extreme = legIsBull ? Low[0] : High[0];
                 setupState    = S.WaitingSweep2;
-                D($"Bar {CurrentBar}: [S1] ExtLevel {activeExtLevel:F2} swept → LL1={sweep1Extreme:F2}. Waiting for S2.");
+                D($"Bar {CurrentBar}: [S1] ExtLevel {activeExtLevel:F2} swept → LL1={sweep1Extreme:F2}. Waiting S2 ...");
             }
         }
 
