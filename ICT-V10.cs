@@ -39,7 +39,7 @@ using NinjaTrader.NinjaScript.Strategies;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class ICTV9 : Strategy
+    public class ICTV10 : Strategy
     {
         private const string StrategyVersion = "v10";
 
